@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          iscc //DMyAppVersion="$VERSION" //Q packaging/preprint.iss
+          iscc //DMyAppVersion="$VERSION" //Q preprint.iss
 
       - name: Upload Windows installer
         if: runner.os == 'Windows'
