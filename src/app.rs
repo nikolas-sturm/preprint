@@ -1454,19 +1454,36 @@ impl PreprintApp {
 
         let mut open = self.preview.open;
         let title = tr!("preview-title");
-        egui::Window::new(&title)
-            .open(&mut open)
-            .resizable(true)
-            .default_size([960.0, 720.0])
-            .min_width(560.0)
-            .min_height(420.0)
-            .show(ctx, |ui| {
-                self.draw_preview_contents(ui);
-            });
+        let fullscreen = self.preview.fullscreen;
+        let window_id = egui::Id::new("preprint-preview");
+
+        let mut window = egui::Window::new(&title).id(window_id).open(&mut open);
+        if fullscreen {
+            let screen = ctx
+                .input(|i| i.raw.screen_rect)
+                .unwrap_or(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                ));
+            window = window
+                .title_bar(false)
+                .resizable(false)
+                .fixed_pos(screen.min)
+                .fixed_size(screen.size());
+        } else {
+            window = window
+                .resizable(true)
+                .default_size([960.0, 720.0])
+                .min_width(560.0)
+                .min_height(420.0);
+        }
+        window.show(ctx, |ui| {
+            self.draw_preview_contents(ui, fullscreen);
+        });
         self.preview.open = open;
     }
 
-    fn draw_preview_contents(&mut self, ui: &mut egui::Ui) {
+    fn draw_preview_contents(&mut self, ui: &mut egui::Ui, fullscreen: bool) {
         let p = palette(ui.ctx());
         ui.horizontal_wrapped(|ui| {
             let softproof_available = self.preview_softproof_texture.is_some();
@@ -1516,6 +1533,23 @@ impl PreprintApp {
                         .color(p.dim_text),
                 );
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (fs_icon, fs_label) = if fullscreen {
+                    (icons::ARROWS_IN.as_str(), tr!("exit-fullscreen"))
+                } else {
+                    (icons::ARROWS_OUT.as_str(), tr!("fullscreen"))
+                };
+                if ui.button(format!("{}  {}", fs_icon, fs_label)).clicked() {
+                    self.preview.fullscreen = !self.preview.fullscreen;
+                }
+                if fullscreen
+                    && ui
+                        .button(format!("{}  {}", icons::X.as_str(), tr!("close")))
+                        .clicked()
+                {
+                    self.preview.open = false;
+                }
+            });
         });
 
         ui.add_space(2.0);
