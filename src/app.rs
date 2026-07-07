@@ -2171,6 +2171,7 @@ mod tests {
         crate::i18n::init();
         let (_sender, receiver) = mpsc::channel();
         let mut app = PreprintApp::default();
+        let idle_label = app.preview.progress_label().to_owned();
         app.preview_request_id = 7;
         app.preview_receiver = Some(receiver);
         app.preview.open = true;
@@ -2187,7 +2188,7 @@ mod tests {
         assert!(!app.preview.open);
         assert!(!app.preview.rendering);
         assert_eq!(app.preview.progress(), 0.0);
-        assert_eq!(app.preview.progress_label(), tr!("idle"));
+        assert_eq!(app.preview.progress_label(), idle_label);
         assert!(app.preview.compression_label().is_empty());
         assert!(app.preview_image_size.is_none());
     }

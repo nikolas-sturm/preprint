@@ -10,8 +10,6 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: "-C target-cpu=x86-64-v3"
     strategy:
       fail-fast: false
       matrix:
@@ -19,6 +17,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - name: Configure target-cpu
+        shell: bash
+        run: |
+          case "${{ runner.arch }}" in
+            X64)   echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> $GITHUB_ENV ;;
+            ARM64) echo "RUSTFLAGS=-C target-cpu=apple-m1"  >> $GITHUB_ENV ;;
+          esac
 
       - uses: dtolnay/rust-toolchain@stable
 
