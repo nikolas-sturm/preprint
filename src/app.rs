@@ -1,10 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver},
-    },
+    sync::mpsc::{self, Receiver},
     thread,
 };
 
@@ -13,6 +10,7 @@ use eframe::egui;
 use egui_i18n::tr;
 use egui_phosphor_icons::icons;
 use image::DynamicImage;
+use image::GenericImageView;
 use rayon::prelude::*;
 use rfd::FileDialog;
 
@@ -54,7 +52,6 @@ pub struct PreprintApp {
     preview_image_size: Option<[usize; 2]>,
     preview_receiver: Option<Receiver<PreviewMessage>>,
     preview_request_id: u64,
-    preview_shared: Arc<Mutex<PreviewViewportShared>>,
     status_message: Option<StatusMessage>,
     batch: Option<BatchState>,
 }
@@ -84,7 +81,6 @@ impl Default for PreprintApp {
             preview_image_size: None,
             preview_receiver: None,
             preview_request_id: 0,
-            preview_shared: Arc::new(Mutex::new(PreviewViewportShared::default())),
             status_message: None,
             batch: None,
         }
@@ -126,10 +122,10 @@ impl ThemePalette {
             accent: egui::Color32::from_rgb(96, 165, 250),
             accent_hover: egui::Color32::from_rgb(124, 184, 255),
             accent_dim: egui::Color32::from_rgb(58, 96, 140),
-            text_primary: egui::Color32::from_rgb(232, 236, 244),
-            text_secondary: egui::Color32::from_rgb(176, 182, 196),
-            dim_text: egui::Color32::from_rgb(140, 146, 162),
-            faint_text: egui::Color32::from_rgb(104, 110, 124),
+            text_primary: egui::Color32::from_rgb(242, 245, 250),
+            text_secondary: egui::Color32::from_rgb(202, 208, 220),
+            dim_text: egui::Color32::from_rgb(172, 179, 194),
+            faint_text: egui::Color32::from_rgb(144, 151, 168),
             card_bg: egui::Color32::from_rgb(28, 31, 36),
             card_stroke: egui::Color32::from_rgb(46, 50, 58),
             hairline: egui::Color32::from_rgb(40, 44, 52),
@@ -151,23 +147,23 @@ impl ThemePalette {
             accent: egui::Color32::from_rgb(37, 99, 235),
             accent_hover: egui::Color32::from_rgb(29, 78, 216),
             accent_dim: egui::Color32::from_rgb(147, 197, 253),
-            text_primary: egui::Color32::from_rgb(28, 32, 42),
-            text_secondary: egui::Color32::from_rgb(71, 78, 94),
-            dim_text: egui::Color32::from_rgb(120, 128, 144),
-            faint_text: egui::Color32::from_rgb(160, 168, 184),
+            text_primary: egui::Color32::from_rgb(24, 28, 36),
+            text_secondary: egui::Color32::from_rgb(58, 66, 82),
+            dim_text: egui::Color32::from_rgb(95, 104, 122),
+            faint_text: egui::Color32::from_rgb(122, 131, 148),
             card_bg: egui::Color32::from_rgb(255, 255, 255),
             card_stroke: egui::Color32::from_rgb(218, 222, 230),
             hairline: egui::Color32::from_rgb(224, 228, 236),
-            error_color: egui::Color32::from_rgb(220, 60, 60),
-            ok_color: egui::Color32::from_rgb(60, 170, 99),
-            warn_color: egui::Color32::from_rgb(200, 140, 30),
-            panel_fill: egui::Color32::from_rgb(245, 246, 248),
+            error_color: egui::Color32::from_rgb(200, 50, 50),
+            ok_color: egui::Color32::from_rgb(40, 150, 80),
+            warn_color: egui::Color32::from_rgb(180, 120, 20),
+            panel_fill: egui::Color32::from_rgb(242, 244, 247),
             window_fill: egui::Color32::from_rgb(255, 255, 255),
-            extreme_bg: egui::Color32::from_rgb(232, 235, 240),
-            faint_bg: egui::Color32::from_rgb(238, 240, 244),
-            inactive_bg: egui::Color32::from_rgb(238, 240, 244),
-            hovered_weak_bg: egui::Color32::from_rgb(228, 232, 238),
-            open_weak_bg: egui::Color32::from_rgb(232, 236, 242),
+            extreme_bg: egui::Color32::from_rgb(228, 232, 238),
+            faint_bg: egui::Color32::from_rgb(236, 239, 243),
+            inactive_bg: egui::Color32::from_rgb(236, 239, 243),
+            hovered_weak_bg: egui::Color32::from_rgb(226, 230, 236),
+            open_weak_bg: egui::Color32::from_rgb(230, 234, 240),
         }
     }
 
@@ -472,58 +468,7 @@ impl PreprintApp {
             }
         }
 
-        self.push_preview_shared();
         ctx.request_repaint();
-    }
-
-    fn pull_preview_shared(&mut self) {
-        let shared = self
-            .preview_shared
-            .lock()
-            .expect("preview state lock poisoned");
-        self.preview.open = shared.open;
-        self.preview.fullscreen = shared.fullscreen;
-        self.preview.fit_to_window = shared.fit_to_window;
-        self.preview.set_softproof_enabled(shared.softproof_enabled);
-        self.preview.set_magnifier_enabled(shared.magnifier_enabled);
-        self.preview.set_magnifier_zoom(shared.magnifier_zoom);
-        self.preview.set_magnifier_radius(shared.magnifier_radius);
-        self.softproof.set_enabled(shared.softproof_enabled);
-    }
-
-    fn push_preview_shared(&self) {
-        let mut shared = self
-            .preview_shared
-            .lock()
-            .expect("preview state lock poisoned");
-        shared.open = self.preview.open;
-        shared.fullscreen = self.preview.fullscreen;
-        shared.fit_to_window = self.preview.fit_to_window;
-        shared.rendering = self.preview.rendering;
-        shared.progress = self.preview.progress();
-        shared.progress_label = self.preview.progress_label().to_owned();
-        shared.softproof_enabled = self.preview.softproof_enabled();
-        shared.compression_label = self.preview.compression_label().to_owned();
-        shared.magnifier_enabled = self.preview.magnifier_enabled();
-        shared.magnifier_zoom = self.preview.magnifier_zoom();
-        shared.magnifier_radius = self.preview.magnifier_radius();
-        shared.base_texture_id = self
-            .preview_base_texture
-            .as_ref()
-            .map(|texture| texture.id());
-        shared.base_nearest_texture_id = self
-            .preview_base_nearest_texture
-            .as_ref()
-            .map(|texture| texture.id());
-        shared.softproof_texture_id = self
-            .preview_softproof_texture
-            .as_ref()
-            .map(|texture| texture.id());
-        shared.softproof_nearest_texture_id = self
-            .preview_softproof_nearest_texture
-            .as_ref()
-            .map(|texture| texture.id());
-        shared.image_size = self.preview_image_size;
     }
 
     fn pick_files(&mut self) {
@@ -607,15 +552,15 @@ impl PreprintApp {
         self.preview_receiver = Some(receiver);
         self.preview.mark_rendering();
         self.status_message = Some(StatusMessage::ok(tr!("rendering")));
-        self.push_preview_shared();
 
         thread::spawn(move || {
             send_preview_progress(&sender, request_id, 0.10, tr!("loading-image"));
             let result = load_image(&path)
                 .context("failed to load image")
-                .and_then(|loaded| {
+                .map(|loaded| downscale_for_preview(loaded.image))
+                .and_then(|image| {
                     send_preview_progress(&sender, request_id, 0.35, tr!("applying-border"));
-                    add_border(&loaded.image, &processing).context("failed to add border")
+                    add_border(&image, &processing).context("failed to add border")
                 })
                 .and_then(|base| {
                     send_preview_progress(&sender, request_id, 0.58, tr!("simulating-compression"));
@@ -1502,25 +1447,155 @@ impl PreprintApp {
         }
     }
 
-    fn show_preview_viewport(&mut self, ctx: &egui::Context) {
-        self.push_preview_shared();
-
+    fn show_preview_window(&mut self, ctx: &egui::Context) {
         if !self.preview.open {
             return;
         }
 
-        let viewport_id = egui::ViewportId::from_hash_of("preprint-preview");
-        let preview_title = tr!("preview-title");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(preview_title)
-            .with_inner_size([960.0, 720.0])
-            .with_resizable(true)
-            .with_fullscreen(self.preview.fullscreen);
+        let mut open = self.preview.open;
+        let title = tr!("preview-title");
+        egui::Window::new(&title)
+            .open(&mut open)
+            .resizable(true)
+            .default_size([960.0, 720.0])
+            .min_width(560.0)
+            .min_height(420.0)
+            .show(ctx, |ui| {
+                self.draw_preview_contents(ui);
+            });
+        self.preview.open = open;
+    }
 
-        let shared = Arc::clone(&self.preview_shared);
-        ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
-            draw_preview_window(ui, &shared);
+    fn draw_preview_contents(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
+        ui.horizontal_wrapped(|ui| {
+            let softproof_available = self.preview_softproof_texture.is_some();
+            let softproof_label = if softproof_available {
+                if self.preview.softproof_enabled {
+                    format!("{}  {}", icons::EYE.as_str(), tr!("softproof-on"))
+                } else {
+                    format!("{}  {}", icons::EYE_SLASH.as_str(), tr!("softproof-off"))
+                }
+            } else {
+                tr!("no-softproof-profile")
+            };
+            if ui
+                .add_enabled(softproof_available, egui::Button::new(softproof_label))
+                .clicked()
+            {
+                self.preview
+                    .set_softproof_enabled(!self.preview.softproof_enabled());
+            }
+            let magnifier_label =
+                format!("{}  {}", icons::MAGNIFYING_GLASS.as_str(), tr!("magnifier"));
+            ui.toggle_value(&mut self.preview.magnifier_enabled, magnifier_label);
+            if self.preview.magnifier_enabled {
+                let zoom_label = tr!("zoom");
+                let lens_label = tr!("lens");
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.preview.magnifier_zoom,
+                        MIN_MAGNIFIER_ZOOM..=MAX_MAGNIFIER_ZOOM,
+                    )
+                    .text(zoom_label)
+                    .suffix("\u{00D7}"),
+                );
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.preview.magnifier_radius,
+                        MIN_MAGNIFIER_RADIUS..=MAX_MAGNIFIER_RADIUS,
+                    )
+                    .text(lens_label),
+                );
+                self.preview.set_magnifier_zoom(self.preview.magnifier_zoom);
+                self.preview
+                    .set_magnifier_radius(self.preview.magnifier_radius);
+                ui.label(
+                    egui::RichText::new(tr!("magnifier-hint"))
+                        .small()
+                        .color(p.dim_text),
+                );
+            }
         });
+
+        ui.add_space(2.0);
+        ui.add(egui::Separator::default().spacing(8.0));
+
+        if !self.preview.compression_label().is_empty() {
+            ui.label(
+                egui::RichText::new(self.preview.compression_label().to_owned())
+                    .small()
+                    .color(p.dim_text),
+            );
+        }
+
+        if self.preview.rendering {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(self.preview.progress())
+                            .animate(true)
+                            .desired_width(280.0)
+                            .text(self.preview.progress_label().to_owned()),
+                    );
+                });
+            });
+            return;
+        }
+
+        let (texture_id, nearest_texture_id) = if self.preview.softproof_enabled() {
+            (
+                self.preview_softproof_texture
+                    .as_ref()
+                    .or(self.preview_base_texture.as_ref())
+                    .map(|t| t.id()),
+                self.preview_softproof_nearest_texture
+                    .as_ref()
+                    .or(self.preview_base_nearest_texture.as_ref())
+                    .map(|t| t.id()),
+            )
+        } else {
+            (
+                self.preview_base_texture.as_ref().map(|t| t.id()),
+                self.preview_base_nearest_texture.as_ref().map(|t| t.id()),
+            )
+        };
+
+        let Some(image_size) = self.preview_image_size else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new(tr!("no-preview-yet")).color(p.dim_text));
+            });
+            return;
+        };
+
+        let (Some(texture_id), Some(nearest_texture_id)) = (texture_id, nearest_texture_id) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new(tr!("no-preview-yet")).color(p.dim_text));
+            });
+            return;
+        };
+
+        self.draw_fitted_preview_image(ui, texture_id, nearest_texture_id, image_size);
+    }
+
+    fn draw_fitted_preview_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        texture_id: egui::TextureId,
+        nearest_texture_id: egui::TextureId,
+        image_size: [usize; 2],
+    ) {
+        draw_fitted_preview_image(
+            ui,
+            self.preview.magnifier_enabled(),
+            self.preview.magnifier_radius(),
+            self.preview.magnifier_zoom(),
+            texture_id,
+            nearest_texture_id,
+            image_size,
+        );
     }
 }
 
@@ -1533,7 +1608,6 @@ impl eframe::App for PreprintApp {
         Self::configure_style(ui.ctx());
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
-        self.pull_preview_shared();
         self.poll_batch();
         self.poll_preview(&ctx);
 
@@ -1547,25 +1621,29 @@ impl eframe::App for PreprintApp {
                 self.draw_status_strip(ui);
                 ui.add_space(14.0);
 
-                ui.columns(2, |columns| {
-                    columns[0].set_min_width(380.0);
-                    columns[0].vertical(|ui| {
-                        self.draw_file_card(ui, &ctx);
-                        ui.add_space(12.0);
-                        self.draw_batch_card(ui);
-                    });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            columns[0].set_min_width(380.0);
+                            columns[0].vertical(|ui| {
+                                self.draw_file_card(ui, &ctx);
+                                ui.add_space(12.0);
+                                self.draw_batch_card(ui);
+                            });
 
-                    columns[1].vertical(|ui| {
-                        self.draw_print_card(ui);
-                        ui.add_space(12.0);
-                        self.draw_output_card(ui);
-                        ui.add_space(12.0);
-                        self.draw_preview_summary(ui, &ctx);
+                            columns[1].vertical(|ui| {
+                                self.draw_print_card(ui);
+                                ui.add_space(12.0);
+                                self.draw_output_card(ui);
+                                ui.add_space(12.0);
+                                self.draw_preview_summary(ui, &ctx);
+                            });
+                        });
                     });
-                });
             });
 
-        self.show_preview_viewport(&ctx);
+        self.show_preview_window(&ctx);
     }
 }
 
@@ -1627,49 +1705,6 @@ impl StatusMessage {
         Self {
             text: text.into(),
             is_error: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct PreviewViewportShared {
-    open: bool,
-    fullscreen: bool,
-    fit_to_window: bool,
-    rendering: bool,
-    progress: f32,
-    progress_label: String,
-    softproof_enabled: bool,
-    compression_label: String,
-    magnifier_enabled: bool,
-    magnifier_zoom: f32,
-    magnifier_radius: f32,
-    base_texture_id: Option<egui::TextureId>,
-    base_nearest_texture_id: Option<egui::TextureId>,
-    softproof_texture_id: Option<egui::TextureId>,
-    softproof_nearest_texture_id: Option<egui::TextureId>,
-    image_size: Option<[usize; 2]>,
-}
-
-impl Default for PreviewViewportShared {
-    fn default() -> Self {
-        Self {
-            open: false,
-            fullscreen: false,
-            fit_to_window: true,
-            rendering: false,
-            progress: 0.0,
-            progress_label: tr!("idle"),
-            softproof_enabled: true,
-            compression_label: String::new(),
-            magnifier_enabled: false,
-            magnifier_zoom: 4.0,
-            magnifier_radius: 120.0,
-            base_texture_id: None,
-            base_nearest_texture_id: None,
-            softproof_texture_id: None,
-            softproof_nearest_texture_id: None,
-            image_size: None,
         }
     }
 }
@@ -1825,156 +1860,11 @@ fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Respon
     response
 }
 
-fn draw_preview_window(ui: &mut egui::Ui, shared: &Arc<Mutex<PreviewViewportShared>>) {
-    let mut state = shared.lock().expect("preview state lock poisoned");
-
-    if ui.input(|input| input.viewport().close_requested()) {
-        state.open = false;
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        return;
-    }
-
-    PreprintApp::configure_style(ui.ctx());
-
-    egui::Frame::NONE
-        .inner_margin(egui::Margin::same(18))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let softproof_available = state.softproof_texture_id.is_some();
-                let softproof_label = if softproof_available {
-                    if state.softproof_enabled {
-                        format!("{}  {}", icons::EYE.as_str(), tr!("softproof-on"))
-                    } else {
-                        format!("{}  {}", icons::EYE_SLASH.as_str(), tr!("softproof-off"))
-                    }
-                } else {
-                    tr!("no-softproof-profile")
-                };
-                if ui
-                    .add_enabled(softproof_available, egui::Button::new(softproof_label))
-                    .clicked()
-                {
-                    state.softproof_enabled = !state.softproof_enabled;
-                }
-                let magnifier_label =
-                    format!("{}  {}", icons::MAGNIFYING_GLASS.as_str(), tr!("magnifier"));
-                ui.toggle_value(&mut state.magnifier_enabled, magnifier_label);
-                if state.magnifier_enabled {
-                    let zoom_label = tr!("zoom");
-                    let lens_label = tr!("lens");
-                    ui.add(
-                        egui::Slider::new(
-                            &mut state.magnifier_zoom,
-                            MIN_MAGNIFIER_ZOOM..=MAX_MAGNIFIER_ZOOM,
-                        )
-                        .text(zoom_label)
-                        .suffix("\u{00D7}"),
-                    );
-                    ui.add(
-                        egui::Slider::new(
-                            &mut state.magnifier_radius,
-                            MIN_MAGNIFIER_RADIUS..=MAX_MAGNIFIER_RADIUS,
-                        )
-                        .text(lens_label),
-                    );
-                    state.magnifier_zoom = state
-                        .magnifier_zoom
-                        .clamp(MIN_MAGNIFIER_ZOOM, MAX_MAGNIFIER_ZOOM);
-                    state.magnifier_radius = state
-                        .magnifier_radius
-                        .clamp(MIN_MAGNIFIER_RADIUS, MAX_MAGNIFIER_RADIUS);
-                    ui.label(
-                        egui::RichText::new(tr!("magnifier-hint"))
-                            .small()
-                            .color(palette(ui.ctx()).dim_text),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(format!("{}  {}", icons::X.as_str(), tr!("close")))
-                        .clicked()
-                    {
-                        state.open = false;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    let (fs_icon, fs_label) = if state.fullscreen {
-                        (icons::ARROWS_IN.as_str(), tr!("exit-fullscreen"))
-                    } else {
-                        (icons::ARROWS_OUT.as_str(), tr!("fullscreen"))
-                    };
-                    if ui.button(format!("{}  {}", fs_icon, fs_label)).clicked() {
-                        state.fullscreen = !state.fullscreen;
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(state.fullscreen));
-                    }
-                });
-            });
-
-            ui.add_space(2.0);
-            ui.add(egui::Separator::default().spacing(8.0));
-
-            if !state.compression_label.is_empty() {
-                ui.label(
-                    egui::RichText::new(state.compression_label.clone())
-                        .small()
-                        .color(palette(ui.ctx()).dim_text),
-                );
-            }
-
-            'render: {
-                if state.rendering {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.spinner();
-                            ui.add_space(10.0);
-                            ui.add(
-                                egui::ProgressBar::new(state.progress)
-                                    .animate(true)
-                                    .desired_width(280.0)
-                                    .text(state.progress_label.clone()),
-                            );
-                        });
-                    });
-                    break 'render;
-                }
-
-                let (texture_id, nearest_texture_id) = if state.softproof_enabled {
-                    (
-                        state.softproof_texture_id.or(state.base_texture_id),
-                        state
-                            .softproof_nearest_texture_id
-                            .or(state.base_nearest_texture_id),
-                    )
-                } else {
-                    (state.base_texture_id, state.base_nearest_texture_id)
-                };
-
-                let (Some(texture_id), Some(nearest_texture_id), Some(image_size)) =
-                    (texture_id, nearest_texture_id, state.image_size)
-                else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(tr!("no-preview-yet"))
-                                .color(palette(ui.ctx()).dim_text),
-                        );
-                    });
-                    break 'render;
-                };
-
-                draw_fitted_preview_image(
-                    ui,
-                    &mut state,
-                    texture_id,
-                    nearest_texture_id,
-                    image_size,
-                );
-            }
-        });
-}
-
 fn draw_fitted_preview_image(
     ui: &mut egui::Ui,
-    state: &mut PreviewViewportShared,
+    magnifier_enabled: bool,
+    magnifier_radius: f32,
+    magnifier_zoom: f32,
     texture_id: egui::TextureId,
     nearest_texture_id: egui::TextureId,
     image_size: [usize; 2],
@@ -1999,7 +1889,7 @@ fn draw_fitted_preview_image(
         egui::Sense::click_and_drag(),
     );
 
-    if state.magnifier_enabled
+    if magnifier_enabled
         && response.contains_pointer()
         && ui.input(|input| input.pointer.primary_down())
         && let Some(center) = ui.input(|input| input.pointer.hover_pos())
@@ -2009,8 +1899,8 @@ fn draw_fitted_preview_image(
             nearest_texture_id,
             image_rect,
             center,
-            state.magnifier_radius,
-            state.magnifier_zoom,
+            magnifier_radius,
+            magnifier_zoom,
         );
     }
 }
@@ -2160,6 +2050,23 @@ fn dynamic_to_color_image(image: &DynamicImage) -> egui::ColorImage {
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
     )
+}
+
+/// Downscale very large source images for the preview path so that expensive
+/// operations (notably the `MirroredBlur` gaussian) stay interactive. Borders
+/// scale proportionally, so the preview stays visually representative. The
+/// export path is unaffected and always operates on the full-resolution image.
+fn downscale_for_preview(image: DynamicImage) -> DynamicImage {
+    const MAX_PREVIEW_DIM: u32 = 2400;
+    let (width, height) = image.dimensions();
+    let longest = width.max(height);
+    if longest <= MAX_PREVIEW_DIM {
+        return image;
+    }
+    let scale = MAX_PREVIEW_DIM as f32 / longest as f32;
+    let new_width = ((width as f32) * scale).max(1.0) as u32;
+    let new_height = ((height as f32) * scale).max(1.0) as u32;
+    image.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
 }
 
 #[cfg(test)]
