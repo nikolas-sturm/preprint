@@ -54,6 +54,7 @@ pub struct PreprintApp {
     preview_request_id: u64,
     status_message: Option<StatusMessage>,
     batch: Option<BatchState>,
+    logo_texture: Option<egui::TextureHandle>,
 }
 
 impl Default for PreprintApp {
@@ -83,7 +84,25 @@ impl Default for PreprintApp {
             preview_request_id: 0,
             status_message: None,
             batch: None,
+            logo_texture: None,
         }
+    }
+}
+
+impl PreprintApp {
+    pub fn new(ctx: &egui::Context) -> Self {
+        let mut app = Self::default();
+        let bytes = include_bytes!("../assets/logo_220x220.png");
+        if let Ok(image) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+            let rgba = image.to_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            app.logo_texture =
+                Some(ctx.load_texture("preprint-logo", color_image, egui::TextureOptions::LINEAR));
+        }
+        app
     }
 }
 
@@ -722,12 +741,16 @@ impl PreprintApp {
 
     fn draw_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label(
-                icons::IMAGE_SQUARE
-                    .regular()
-                    .color(palette(ui.ctx()).accent)
-                    .size(22.0),
-            );
+            if let Some(tex) = &self.logo_texture {
+                ui.add(egui::Image::from_texture(tex).fit_to_exact_size(egui::vec2(28.0, 28.0)));
+            } else {
+                ui.label(
+                    icons::IMAGE_SQUARE
+                        .regular()
+                        .color(palette(ui.ctx()).accent)
+                        .size(22.0),
+                );
+            }
             ui.add_space(2.0);
             ui.heading(
                 egui::RichText::new("Preprint")

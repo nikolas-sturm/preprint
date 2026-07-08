@@ -18,7 +18,7 @@ fn main() -> eframe::Result {
             register_fonts(&cc.egui_ctx);
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             preprint::i18n::init();
-            Ok(Box::<preprint::app::PreprintApp>::default())
+            Ok(Box::new(preprint::app::PreprintApp::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -38,28 +38,14 @@ fn register_fonts(ctx: &egui::Context) {
 }
 
 fn load_icon() -> egui::IconData {
-    let size = 32usize;
-    let accent = [96u8, 165, 250];
-    let dark = [22u8, 24, 28];
-    let white = [255u8, 255, 255];
-    let mut rgba = Vec::with_capacity(size * size * 4);
-    for y in 0..size {
-        for x in 0..size {
-            let on_frame = x >= 3 && x < size - 3 && y >= 3 && y < size - 3;
-            let on_inner = x >= 8 && x < size - 8 && y >= 8 && y < size - 8;
-            let rgb = if on_inner {
-                white
-            } else if on_frame {
-                accent
-            } else {
-                dark
-            };
-            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-        }
-    }
+    let bytes = include_bytes!("../assets/logo_220x220.png");
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .expect("failed to decode logo_220x220.png")
+        .to_rgba8();
+    let (width, height) = image.dimensions();
     egui::IconData {
-        rgba,
-        width: size as u32,
-        height: size as u32,
+        rgba: image.into_raw(),
+        width,
+        height,
     }
 }
