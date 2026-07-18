@@ -1,0 +1,5 @@
+[advisories]
+# quick-xml is used only by build-time protocol generators (wayland-scanner and
+# xcb) on dependency-owned XML, never on user-controlled runtime input. Remove
+# these exceptions when upstream releases support quick-xml 0.41 or newer.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

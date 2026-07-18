@@ -1,6 +1,6 @@
 use preprint::{
     app::{PreprintApp, PreviewState},
-    export::OutputFormat,
+    export::{BitDepth, OutputFormat, TiffCompression, TiffDeflateLevel},
     loader::SourceBitDepth,
     processing::{BorderStyle, PrintSizeMm},
 };
@@ -9,10 +9,13 @@ use preprint::{
 fn app_defaults_match_print_workflow() {
     let app = PreprintApp::default();
 
-    assert_eq!(app.print_size(), PrintSizeMm::new(100.0, 150.0));
-    assert_eq!(app.border_mm(), 5.0);
-    assert_eq!(app.border_style(), BorderStyle::White);
-    assert_eq!(app.output_format(), OutputFormat::Png);
+    assert_eq!(app.print_size(), PrintSizeMm::new(600.0, 400.0));
+    assert_eq!(app.border_mm(), 8.0);
+    assert_eq!(app.border_style(), BorderStyle::MirroredBlur);
+    assert_eq!(app.output_format(), OutputFormat::Tiff);
+    assert_eq!(app.bit_depth(), BitDepth::Sixteen);
+    assert_eq!(app.tiff_compression(), TiffCompression::Deflate);
+    assert_eq!(app.tiff_deflate_level(), TiffDeflateLevel::Best);
     assert_eq!(app.quality(), 90);
 }
 
@@ -27,12 +30,12 @@ fn preview_window_defaults_to_closed_fit_mode() {
 }
 
 #[test]
-fn preview_state_marks_background_rendering_as_open_and_busy() {
+fn preview_state_marks_background_rendering_busy_without_opening_window() {
     let mut preview = PreviewState::default();
 
     preview.mark_rendering();
 
-    assert!(preview.open);
+    assert!(!preview.open);
     assert!(preview.rendering);
     assert!(preview.progress() > 0.0);
 }

@@ -1,8 +1,9 @@
-use image::{DynamicImage, Rgba, RgbaImage};
+use image::{DynamicImage, ImageDecoder, Rgba, RgbaImage};
 use preprint::{
     export::{
         BitDepth, ExportOptions, OutputFormat, can_export_bit_depth, compression_preview_image,
-        compression_preview_label, extension, save_image, unique_output_path,
+        compression_preview_label_for_locale, extension, save_image, save_image_with_cancel,
+        save_image_with_icc_profile_and_cancel, unique_output_path,
     },
     loader::SourceBitDepth,
 };
@@ -10,6 +11,39 @@ use tempfile::tempdir;
 
 fn test_image() -> DynamicImage {
     DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([20, 40, 60, 255])))
+}
+
+fn embedded_icc_profile(path: &std::path::Path, format: OutputFormat) -> Vec<u8> {
+    match format {
+        OutputFormat::Png => {
+            let decoder =
+                png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+            decoder
+                .read_info()
+                .unwrap()
+                .info()
+                .icc_profile
+                .as_ref()
+                .unwrap()
+                .to_vec()
+        }
+        OutputFormat::Jpeg => {
+            let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::BufReader::new(
+                std::fs::File::open(path).unwrap(),
+            ))
+            .unwrap();
+            decoder.icc_profile().unwrap().unwrap()
+        }
+        OutputFormat::Tiff => {
+            let mut decoder =
+                tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+            decoder
+                .get_tag(tiff::tags::Tag::IccProfile)
+                .unwrap()
+                .into_u8_vec()
+                .unwrap()
+        }
+    }
 }
 
 #[test]
@@ -51,6 +85,130 @@ fn saves_png_jpeg_and_tiff_files() {
 }
 
 #[test]
+fn exports_embed_valid_srgb_profile_by_default() {
+    let dir = tempdir().unwrap();
+    for (format, name) in [
+        (OutputFormat::Png, "out.png"),
+        (OutputFormat::Jpeg, "out.jpg"),
+        (OutputFormat::Tiff, "out.tiff"),
+    ] {
+        let path = dir.path().join(name);
+        save_image(&test_image(), &path, &ExportOptions::new(format, 90)).unwrap();
+
+        let profile = embedded_icc_profile(&path, format);
+        let profile = lcms2::Profile::new_icc(&profile).unwrap();
+        assert_eq!(profile.color_space(), lcms2::ColorSpaceSignature::RgbData);
+    }
+}
+
+#[test]
+fn exports_preserve_valid_source_rgb_profile() {
+    let dir = tempdir().unwrap();
+    let profile = lcms2::Profile::new_srgb();
+    profile.set_encoded_icc_version(0x0210_0000);
+    let profile = profile.icc().unwrap();
+
+    for (format, name) in [
+        (OutputFormat::Png, "source.png"),
+        (OutputFormat::Jpeg, "source.jpg"),
+        (OutputFormat::Tiff, "source.tiff"),
+    ] {
+        let path = dir.path().join(name);
+        save_image_with_icc_profile_and_cancel(
+            &test_image(),
+            &path,
+            &ExportOptions::new(format, 90),
+            Some(&profile),
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(embedded_icc_profile(&path, format), profile);
+    }
+}
+
+#[test]
+fn invalid_source_profile_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fallback.png");
+
+    let error = save_image_with_icc_profile_and_cancel(
+        &test_image(),
+        &path,
+        &ExportOptions::new(OutputFormat::Png, 90),
+        Some(b"invalid"),
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("invalid or not RGB"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn png_records_pixel_density() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.png");
+    let options = ExportOptions::new(OutputFormat::Png, 90).with_pixel_density(300, 240);
+
+    save_image(&test_image(), &path, &options).unwrap();
+
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+    let reader = decoder.read_info().unwrap();
+    let dimensions = reader.info().pixel_dims.unwrap();
+    assert_eq!(dimensions.unit, png::Unit::Meter);
+    assert_eq!(dimensions.xppu, 11_811);
+    assert_eq!(dimensions.yppu, 9_449);
+}
+
+#[test]
+fn jpeg_records_pixel_density() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.jpg");
+    let options = ExportOptions::new(OutputFormat::Jpeg, 90).with_pixel_density(300, 240);
+
+    save_image(&test_image(), &path, &options).unwrap();
+
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[0..4], &[0xff, 0xd8, 0xff, 0xe0]);
+    assert_eq!(&bytes[6..11], b"JFIF\0");
+    assert_eq!(bytes[13], 1);
+    assert_eq!(u16::from_be_bytes([bytes[14], bytes[15]]), 300);
+    assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]), 240);
+}
+
+#[test]
+fn tiff_records_pixel_density() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.tiff");
+    let options = ExportOptions::new(OutputFormat::Tiff, 90).with_pixel_density(300, 240);
+
+    save_image(&test_image(), &path, &options).unwrap();
+
+    let mut decoder = tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+    assert_eq!(
+        decoder
+            .get_tag_u32(tiff::tags::Tag::ResolutionUnit)
+            .unwrap(),
+        2
+    );
+    assert!(matches!(
+        decoder.get_tag(tiff::tags::Tag::XResolution).unwrap(),
+        tiff::decoder::ifd::Value::Rational(300, 1)
+    ));
+    assert!(matches!(
+        decoder.get_tag(tiff::tags::Tag::YResolution).unwrap(),
+        tiff::decoder::ifd::Value::Rational(240, 1)
+    ));
+    assert_eq!(
+        decoder
+            .get_tag_u16_vec(tiff::tags::Tag::ExtraSamples)
+            .unwrap(),
+        [2]
+    );
+}
+
+#[test]
 fn rejects_16_bit_tiff_for_8_bit_sources() {
     let mut options = ExportOptions::new(OutputFormat::Tiff, 90);
     options.bit_depth = BitDepth::Sixteen;
@@ -88,26 +246,115 @@ fn saves_real_16_bit_tiff_for_16_bit_image() {
 }
 
 #[test]
+fn saves_16_bit_source_as_8_bit_png_when_requested() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.png");
+    let image = DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+        2,
+        1,
+        image::Rgba([1000, 2000, 3000, 65535]),
+    ));
+
+    save_image(&image, &path, &ExportOptions::new(OutputFormat::Png, 90)).unwrap();
+
+    assert!(matches!(
+        image::open(path).unwrap(),
+        DynamicImage::ImageRgba8(_)
+    ));
+}
+
+#[test]
+fn refuses_to_replace_an_existing_output() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.png");
+    std::fs::write(&path, b"existing").unwrap();
+
+    let error = save_image(
+        &test_image(),
+        &path,
+        &ExportOptions::new(OutputFormat::Png, 90),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(std::fs::read(path).unwrap(), b"existing");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_output_uses_normal_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let reference = dir.path().join("reference");
+    let output = dir.path().join("out.png");
+    std::fs::write(&reference, b"reference").unwrap();
+
+    save_image(
+        &test_image(),
+        &output,
+        &ExportOptions::new(OutputFormat::Png, 90),
+    )
+    .unwrap();
+
+    let reference_mode = std::fs::metadata(reference).unwrap().permissions().mode() & 0o777;
+    let output_mode = std::fs::metadata(output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(output_mode, reference_mode);
+}
+
+#[test]
+fn cancellation_after_encoding_removes_temporary_output() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.png");
+    let checks = AtomicUsize::new(0);
+
+    let error = save_image_with_cancel(
+        &test_image(),
+        &path,
+        &ExportOptions::new(OutputFormat::Png, 90),
+        || checks.fetch_add(1, Ordering::Relaxed) > 0,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "export cancelled");
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn compression_preview_labels_match_output_format() {
-    preprint::i18n::init();
     assert_eq!(
-        compression_preview_label(&ExportOptions::new(OutputFormat::Jpeg, 80)),
+        compression_preview_label_for_locale(&ExportOptions::new(OutputFormat::Jpeg, 80), "en-US"),
         "Compression preview: JPEG q80"
     );
     assert_eq!(
-        compression_preview_label(&ExportOptions::new(OutputFormat::Png, 90)),
+        compression_preview_label_for_locale(&ExportOptions::new(OutputFormat::Png, 90), "en-US"),
         "Compression preview: PNG effort 6"
     );
     assert_eq!(
-        compression_preview_label(&ExportOptions::new(OutputFormat::Tiff, 90)),
+        compression_preview_label_for_locale(&ExportOptions::new(OutputFormat::Tiff, 90), "en-US"),
         "Compression preview: TIFF ZIP (Balanced)"
     );
 
     let mut tiff = ExportOptions::new(OutputFormat::Tiff, 90);
     tiff.tiff_compression = preprint::export::TiffCompression::Lzw;
     assert_eq!(
-        compression_preview_label(&tiff),
+        compression_preview_label_for_locale(&tiff, "en-US"),
         "Compression preview: TIFF LZW"
+    );
+}
+
+#[test]
+fn compression_preview_labels_support_german_without_global_locale() {
+    assert_eq!(
+        compression_preview_label_for_locale(&ExportOptions::new(OutputFormat::Jpeg, 80), "de-DE"),
+        "Kompressionsvorschau: JPEG q80"
+    );
+    assert_eq!(
+        compression_preview_label_for_locale(&ExportOptions::new(OutputFormat::Tiff, 90), "de-DE"),
+        "Kompressionsvorschau: TIFF ZIP (Ausgewogen)"
     );
 }
 
