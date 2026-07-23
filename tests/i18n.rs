@@ -21,10 +21,13 @@ fn translates_both_locales_without_changing_global_locale() {
     );
     assert_eq!(translate_for_locale("unit-inches", "en-US"), "Inches");
     assert_eq!(translate_for_locale("unit-inches", "de-DE"), "Zoll");
-    assert_eq!(translate_for_locale("resize-fit", "en-US"), "Fit and pad");
     assert_eq!(
-        translate_for_locale("resize-fit", "de-DE"),
-        "Einpassen und auffüllen"
+        translate_for_locale("crop-to-fit", "en-US"),
+        "Center crop to fit (no scaling)"
+    );
+    assert_eq!(
+        translate_for_locale("crop-to-fit", "de-DE"),
+        "Mittig passend beschneiden (ohne Skalierung)"
     );
 }
 

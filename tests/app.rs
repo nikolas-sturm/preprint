@@ -20,22 +20,18 @@ fn app_defaults_match_print_workflow() {
 }
 
 #[test]
-fn preview_window_defaults_to_closed_fit_mode() {
+fn preview_state_defaults_to_idle() {
     let preview = PreviewState::default();
 
-    assert!(!preview.open);
-    assert!(preview.fit_to_window);
-    assert!(!preview.fullscreen);
     assert!(!preview.rendering);
 }
 
 #[test]
-fn preview_state_marks_background_rendering_busy_without_opening_window() {
+fn preview_state_marks_background_rendering_busy() {
     let mut preview = PreviewState::default();
 
     preview.mark_rendering();
 
-    assert!(!preview.open);
     assert!(preview.rendering);
     assert!(preview.progress() > 0.0);
 }
@@ -69,30 +65,32 @@ fn sixteen_bit_tiff_is_available_only_for_sixteen_bit_sources() {
 }
 
 #[test]
-fn preview_state_defaults_to_magnifier_off_with_practical_lens() {
+fn preview_state_defaults_to_base_view() {
     let preview = PreviewState::default();
 
-    assert!(!preview.magnifier_enabled());
-    assert_eq!(preview.magnifier_zoom(), 4.0);
-    assert_eq!(preview.magnifier_radius(), 120.0);
     assert_eq!(preview.compression_label(), "");
+    assert!(!preview.crop_overlay_enabled());
+    assert_eq!(preview.zoom_percent(), 100);
 }
 
 #[test]
-fn preview_state_clamps_magnifier_controls() {
+fn preview_state_tracks_crop_overlay_toggle() {
     let mut preview = PreviewState::default();
 
-    preview.set_magnifier_enabled(true);
-    preview.set_magnifier_zoom(0.25);
-    preview.set_magnifier_radius(10.0);
-    assert!(preview.magnifier_enabled());
-    assert_eq!(preview.magnifier_zoom(), 2.0);
-    assert_eq!(preview.magnifier_radius(), 60.0);
+    preview.set_crop_overlay_enabled(true);
 
-    preview.set_magnifier_zoom(40.0);
-    preview.set_magnifier_radius(500.0);
-    assert_eq!(preview.magnifier_zoom(), 12.0);
-    assert_eq!(preview.magnifier_radius(), 220.0);
+    assert!(preview.crop_overlay_enabled());
+}
+
+#[test]
+fn preview_state_clamps_zoom_percentage() {
+    let mut preview = PreviewState::default();
+
+    preview.set_zoom_percent(1);
+    assert_eq!(preview.zoom_percent(), 10);
+
+    preview.set_zoom_percent(900);
+    assert_eq!(preview.zoom_percent(), 800);
 }
 
 #[test]

@@ -8,6 +8,7 @@ fn main() {
         .with_assets(gpui_component_assets::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
+            cx.bind_keys(preprint::app::preview_zoom_key_bindings());
             let (preferences, preferences_error) = match preprint::preferences::load() {
                 Ok(preferences) => (preferences, None),
                 Err(error) => (
@@ -24,8 +25,8 @@ fn main() {
 
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::centered(size(px(1180.), px(800.)), cx)),
-                    window_min_size: Some(size(px(900.), px(600.))),
+                    window_bounds: Some(WindowBounds::centered(size(px(1320.), px(840.)), cx)),
+                    window_min_size: Some(size(px(1080.), px(640.))),
                     app_id: Some("dev.preprint.app".into()),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some("Preprint".into()),

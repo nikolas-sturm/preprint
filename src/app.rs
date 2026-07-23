@@ -12,23 +12,28 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, ExternalPaths, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, WindowBounds, WindowOptions,
-    div, px, size,
+    AnyElement, App, AppContext as _, Context, Entity, ExternalPaths, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled, Subscription, Window,
+    div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, IndexPath, Root, Selectable, StyledExt, Theme,
-    ThemeMode,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, Selectable, StyledExt, Theme, ThemeMode,
     button::{Button, ButtonVariants as _},
-    input::{InputEvent, InputState, NumberInput, NumberInputEvent, SelectAll, StepAction},
+    input::{
+        Escape as InputEscape, InputEvent, InputState, NumberInput, NumberInputEvent, SelectAll,
+        StepAction,
+    },
     progress::Progress,
     select::{Select, SelectEvent, SelectItem, SelectState},
     slider::{Slider, SliderEvent, SliderState},
+    tooltip::Tooltip,
     v_flex,
 };
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, ImageFormat};
+use lcms2::{InfoType, Locale, Profile};
 use rayon::prelude::*;
 use rfd::FileDialog;
 
@@ -42,11 +47,11 @@ use crate::{
     i18n,
     loader::{SourceBitDepth, load_image, load_image_metadata, load_image_with_reservations},
     preferences::{self, LengthUnit, ThemePreference, WorkflowPreferences},
-    preview::{PreviewBitmap, PreviewView},
+    preview::{PreviewBitmap, print_preview_canvas},
     processing::{
-        BorderStyle, MAX_CONCURRENT_PROCESSING_BYTES, PrintSizeMm, ProcessingError,
-        ProcessingOptions, ResizeMode, add_border_with_cancel, aspect_ratio_warning, calculate_ppi,
-        output_ppi, processing_requirements, target_pixel_dimensions,
+        BorderStyle, CropRect, MAX_CONCURRENT_PROCESSING_BYTES, PrintSizeMm, ProcessingError,
+        ProcessingOptions, add_border_with_cancel, add_preview_border_with_cancel, calculate_ppi,
+        crop_rect, output_ppi, processing_requirements,
     },
     softproof::{
         SoftproofError, SoftproofSettings, apply_preview_profile_with_source,
@@ -57,10 +62,21 @@ use crate::{
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "dat"];
 const MAX_QUEUE_FILES: usize = 500;
 const MAX_PREVIEW_DIM: u32 = 2400;
-pub(crate) const MIN_MAGNIFIER_ZOOM: f32 = 2.0;
-pub(crate) const MAX_MAGNIFIER_ZOOM: f32 = 12.0;
-pub(crate) const MIN_MAGNIFIER_RADIUS: f32 = 60.0;
-pub(crate) const MAX_MAGNIFIER_RADIUS: f32 = 220.0;
+const THUMBNAIL_MAX_DIMENSION: u32 = 160;
+const THUMBNAIL_DISPLAY_SIZE: f32 = 68.0;
+const MIN_PREVIEW_ZOOM_PERCENT: u16 = 10;
+const MAX_PREVIEW_ZOOM_PERCENT: u16 = 800;
+const PREVIEW_ZOOM_STEP_PERCENT: i32 = 10;
+
+gpui::actions!(preprint, [ZoomIn, ZoomOut]);
+
+pub fn preview_zoom_key_bindings() -> [KeyBinding; 3] {
+    [
+        KeyBinding::new("ctrl-+", ZoomIn, None),
+        KeyBinding::new("ctrl-=", ZoomIn, None),
+        KeyBinding::new("ctrl--", ZoomOut, None),
+    ]
+}
 
 fn tr(key: &str) -> String {
     i18n::translate(key)
@@ -74,8 +90,6 @@ pub struct PreprintApp {
     length_unit: LengthUnit,
     print_preset: PrintPreset,
     syncing_print_inputs: bool,
-    resize_mode: ResizeMode,
-    target_ppi: u32,
     border_mm: f32,
     border_style: BorderStyle,
     output_format: OutputFormat,
@@ -90,18 +104,22 @@ pub struct PreprintApp {
     pub(crate) preview: PreviewState,
     pub(crate) preview_base: Option<PreviewBitmap>,
     pub(crate) preview_softproof: Option<PreviewBitmap>,
+    pub(crate) preview_crop_base: Option<PreviewBitmap>,
+    pub(crate) preview_crop_softproof: Option<PreviewBitmap>,
+    pub(crate) preview_crop_rect: Option<CropRect>,
     preview_image_size: Option<[usize; 2]>,
     preview_request_id: u64,
     preview_cancel: Option<Arc<AtomicBool>>,
     preview_worker_active: bool,
     preview_refresh_ready: bool,
-    pub(crate) preview_window: Option<AnyWindowHandle>,
     status_message: Option<StatusMessage>,
     batch: Option<BatchState>,
     importing: bool,
     preferences_enabled: bool,
     preferences_save_generation: u64,
     update: AppUpdateState,
+    advanced_open: bool,
+    editing_input_original: Option<String>,
     ui: Option<AppUiState>,
     logo: Arc<gpui::Image>,
 }
@@ -116,8 +134,6 @@ impl Default for PreprintApp {
             length_unit: LengthUnit::Centimeters,
             print_preset: PrintPreset::Size60x40,
             syncing_print_inputs: false,
-            resize_mode: ResizeMode::NoResize,
-            target_ppi: 300,
             border_mm: 8.0,
             border_style: BorderStyle::MirroredBlur,
             output_format: OutputFormat::Tiff,
@@ -132,18 +148,22 @@ impl Default for PreprintApp {
             preview: PreviewState::default(),
             preview_base: None,
             preview_softproof: None,
+            preview_crop_base: None,
+            preview_crop_softproof: None,
+            preview_crop_rect: None,
             preview_image_size: None,
             preview_request_id: 0,
             preview_cancel: None,
             preview_worker_active: false,
             preview_refresh_ready: false,
-            preview_window: None,
             status_message: None,
             batch: None,
             importing: false,
             preferences_enabled: false,
             preferences_save_generation: 0,
             update: AppUpdateState::Idle,
+            advanced_open: false,
+            editing_input_original: None,
             ui: None,
             logo: Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
@@ -159,8 +179,6 @@ struct AppUiState {
     print_height: Entity<InputState>,
     length_unit: Entity<SelectState<Vec<LengthUnit>>>,
     print_preset: Entity<SelectState<Vec<PrintPreset>>>,
-    resize_mode: Entity<SelectState<Vec<ResizeMode>>>,
-    target_ppi: Entity<InputState>,
     border_width: Entity<InputState>,
     border_style: Entity<SelectState<Vec<BorderStyle>>>,
     output_format: Entity<SelectState<Vec<OutputFormat>>>,
@@ -171,6 +189,7 @@ struct AppUiState {
     quality_input: Entity<InputState>,
     png_compression: Entity<SliderState>,
     png_compression_input: Entity<InputState>,
+    preview_zoom: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -335,18 +354,6 @@ impl SelectItem for BorderStyle {
     }
 }
 
-impl SelectItem for ResizeMode {
-    type Value = Self;
-
-    fn title(&self) -> SharedString {
-        self.label().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        self
-    }
-}
-
 impl SelectItem for OutputFormat {
     type Value = Self;
 
@@ -397,33 +404,25 @@ impl SelectItem for TiffDeflateLevel {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewState {
-    pub open: bool,
-    pub fullscreen: bool,
-    pub fit_to_window: bool,
     pub rendering: bool,
     progress: f32,
     progress_label: String,
     softproof_enabled: bool,
     compression_label: String,
-    magnifier_enabled: bool,
-    magnifier_zoom: f32,
-    magnifier_radius: f32,
+    crop_overlay_enabled: bool,
+    zoom_percent: u16,
 }
 
 impl Default for PreviewState {
     fn default() -> Self {
         Self {
-            open: false,
-            fullscreen: false,
-            fit_to_window: true,
             rendering: false,
             progress: 0.0,
             progress_label: tr("idle"),
             softproof_enabled: true,
             compression_label: String::new(),
-            magnifier_enabled: false,
-            magnifier_zoom: 4.0,
-            magnifier_radius: 120.0,
+            crop_overlay_enabled: false,
+            zoom_percent: 100,
         }
     }
 }
@@ -468,28 +467,20 @@ impl PreviewState {
         self.compression_label = label.into();
     }
 
-    pub fn magnifier_enabled(&self) -> bool {
-        self.magnifier_enabled
+    pub fn crop_overlay_enabled(&self) -> bool {
+        self.crop_overlay_enabled
     }
 
-    pub fn set_magnifier_enabled(&mut self, enabled: bool) {
-        self.magnifier_enabled = enabled;
+    pub fn set_crop_overlay_enabled(&mut self, enabled: bool) {
+        self.crop_overlay_enabled = enabled;
     }
 
-    pub fn magnifier_zoom(&self) -> f32 {
-        self.magnifier_zoom
+    pub fn zoom_percent(&self) -> u16 {
+        self.zoom_percent
     }
 
-    pub fn set_magnifier_zoom(&mut self, zoom: f32) {
-        self.magnifier_zoom = zoom.clamp(MIN_MAGNIFIER_ZOOM, MAX_MAGNIFIER_ZOOM);
-    }
-
-    pub fn magnifier_radius(&self) -> f32 {
-        self.magnifier_radius
-    }
-
-    pub fn set_magnifier_radius(&mut self, radius: f32) {
-        self.magnifier_radius = radius.clamp(MIN_MAGNIFIER_RADIUS, MAX_MAGNIFIER_RADIUS);
+    pub fn set_zoom_percent(&mut self, percent: u16) {
+        self.zoom_percent = percent.clamp(MIN_PREVIEW_ZOOM_PERCENT, MAX_PREVIEW_ZOOM_PERCENT);
     }
 }
 
@@ -568,26 +559,6 @@ impl PreprintApp {
                 cx,
             )
         });
-        let resize_mode = cx.new(|cx| {
-            SelectState::new(
-                ResizeMode::ALL.to_vec(),
-                Some(
-                    IndexPath::default().row(
-                        ResizeMode::ALL
-                            .iter()
-                            .position(|mode| *mode == this.resize_mode)
-                            .unwrap_or(0),
-                    ),
-                ),
-                window,
-                cx,
-            )
-        });
-        let target_ppi = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(this.target_ppi.to_string())
-                .validate(|value, _| unsigned_input_is_valid(value, 9600))
-        });
         let border_width = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(this.border_mm.to_string())
@@ -602,6 +573,11 @@ impl PreprintApp {
             InputState::new(window, cx)
                 .default_value(this.png_compression.to_string())
                 .validate(|value, _| integer_input_is_valid(value, 9))
+        });
+        let preview_zoom = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(this.preview.zoom_percent().to_string())
+                .validate(|value, _| preview_zoom_input_is_valid(value))
         });
         let border_style = cx.new(|cx| {
             SelectState::new(
@@ -682,9 +658,51 @@ impl PreprintApp {
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
+            &preview_zoom,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                let parsed = input.read(cx).value().parse::<u16>().ok();
+                match event {
+                    InputEvent::Focus => input
+                        .focus_handle(cx)
+                        .dispatch_action(&SelectAll, window, cx),
+                    InputEvent::Change => {
+                        if let Some(percent) = parsed.filter(|percent| {
+                            (MIN_PREVIEW_ZOOM_PERCENT..=MAX_PREVIEW_ZOOM_PERCENT).contains(percent)
+                        }) {
+                            this.preview.set_zoom_percent(percent);
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. }
+                        if !parsed.is_some_and(|percent| {
+                            (MIN_PREVIEW_ZOOM_PERCENT..=MAX_PREVIEW_ZOOM_PERCENT).contains(&percent)
+                        }) =>
+                    {
+                        input.update(cx, |input, cx| {
+                            input.set_value(this.preview.zoom_percent().to_string(), window, cx)
+                        });
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => {}
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &preview_zoom,
+            window,
+            |this, _, event: &NumberInputEvent, window, cx| {
+                let NumberInputEvent::Step(action) = event;
+                let direction = match action {
+                    StepAction::Increment => 1,
+                    StepAction::Decrement => -1,
+                };
+                this.change_preview_zoom(direction, window, cx);
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
             &language,
             window,
-            |this, _, event: &SelectEvent<Vec<LanguageOption>>, window, cx| {
+            |this, _, event: &SelectEvent<Vec<LanguageOption>>, _, cx| {
                 let SelectEvent::Confirm(Some(language)) = event else {
                     return;
                 };
@@ -706,13 +724,6 @@ impl PreprintApp {
                             .into_owned(),
                     )
                 });
-                if let Some(preview_window) = this.preview_window {
-                    let title = tr("preview-title");
-                    window.defer(cx, move |_, cx| {
-                        let _ = preview_window
-                            .update(cx, |_, window, _| window.set_window_title(&title));
-                    });
-                }
                 cx.refresh_windows();
                 cx.notify();
             },
@@ -787,77 +798,6 @@ impl PreprintApp {
             },
         ));
         subscriptions.push(cx.subscribe_in(
-            &resize_mode,
-            window,
-            |this, _, event: &SelectEvent<Vec<ResizeMode>>, window, cx| {
-                let SelectEvent::Confirm(Some(mode)) = event else {
-                    return;
-                };
-                if this.resize_mode != *mode {
-                    this.resize_mode = *mode;
-                    this.invalidate_preview_and_refresh(window, cx);
-                    this.persist_workflow_preferences();
-                    cx.notify();
-                }
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
-            &target_ppi,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                let parsed = input.read(cx).value().parse::<u32>().ok();
-                match event {
-                    InputEvent::Focus => input
-                        .focus_handle(cx)
-                        .dispatch_action(&SelectAll, window, cx),
-                    InputEvent::Change => {
-                        if let Some(value) = parsed.filter(|value| (1..=9600).contains(value))
-                            && this.target_ppi != value
-                        {
-                            this.target_ppi = value;
-                            if this.resize_mode != ResizeMode::NoResize {
-                                this.invalidate_preview_and_refresh(window, cx);
-                            }
-                            cx.notify();
-                        }
-                    }
-                    InputEvent::Blur | InputEvent::PressEnter { .. }
-                        if !parsed.is_some_and(|value| (1..=9600).contains(&value)) =>
-                    {
-                        input.update(cx, |input, cx| {
-                            input.set_value(this.target_ppi.to_string(), window, cx)
-                        });
-                    }
-                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
-                        this.persist_workflow_preferences();
-                    }
-                }
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
-            &target_ppi,
-            window,
-            |this, input, event: &NumberInputEvent, window, cx| {
-                let NumberInputEvent::Step(action) = event;
-                let value = match action {
-                    StepAction::Increment => this.target_ppi.saturating_add(10),
-                    StepAction::Decrement => this.target_ppi.saturating_sub(10),
-                }
-                .clamp(1, 9600);
-                if this.target_ppi != value {
-                    this.target_ppi = value;
-                    if this.resize_mode != ResizeMode::NoResize {
-                        this.invalidate_preview_and_refresh(window, cx);
-                    }
-                }
-                input.update(cx, |input, cx| {
-                    input.set_value(value.to_string(), window, cx)
-                });
-                this.persist_workflow_preferences();
-                cx.notify();
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
             &print_width,
             window,
             |this, input, event: &InputEvent, window, cx| {
@@ -892,6 +832,13 @@ impl PreprintApp {
                         });
                     }
                     InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        input.update(cx, |input, cx| {
+                            input.set_value(
+                                format_length(this.length_unit.display_value(this.print_width_cm)),
+                                window,
+                                cx,
+                            )
+                        });
                         this.persist_workflow_preferences();
                     }
                 }
@@ -960,6 +907,13 @@ impl PreprintApp {
                         });
                     }
                     InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        input.update(cx, |input, cx| {
+                            input.set_value(
+                                format_length(this.length_unit.display_value(this.print_height_cm)),
+                                window,
+                                cx,
+                            )
+                        });
                         this.persist_workflow_preferences();
                     }
                 }
@@ -1019,6 +973,9 @@ impl PreprintApp {
                         });
                     }
                     InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        input.update(cx, |input, cx| {
+                            input.set_value(format_length(this.border_mm), window, cx)
+                        });
                         this.persist_workflow_preferences();
                     }
                 }
@@ -1278,6 +1235,35 @@ impl PreprintApp {
             },
         ));
 
+        for input in [
+            print_width.clone(),
+            print_height.clone(),
+            border_width.clone(),
+            quality_input.clone(),
+            png_compression_input.clone(),
+            preview_zoom.clone(),
+        ] {
+            subscriptions.push(cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Focus => {
+                        this.editing_input_original = Some(input.read(cx).value().to_string());
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        window.blur();
+                        cx.notify();
+                    }
+                    InputEvent::Blur => {
+                        let value = input.read(cx).value();
+                        input.update(cx, |input, cx| input.set_value(value, window, cx));
+                        this.editing_input_original = None;
+                    }
+                    InputEvent::Change => {}
+                },
+            ));
+        }
+
         subscriptions.push(cx.on_release(|this, _| {
             if let Some(cancel) = this.preview_cancel.take() {
                 cancel.store(true, Ordering::Release);
@@ -1296,8 +1282,6 @@ impl PreprintApp {
             print_height,
             length_unit,
             print_preset,
-            resize_mode,
-            target_ppi,
             border_width,
             border_style,
             output_format,
@@ -1308,6 +1292,7 @@ impl PreprintApp {
             quality_input,
             png_compression,
             png_compression_input,
+            preview_zoom,
             _subscriptions: subscriptions,
         });
         this
@@ -1318,12 +1303,6 @@ impl PreprintApp {
         self.print_height_cm = workflow.print_height_cm;
         self.length_unit = workflow.length_unit;
         self.print_preset = PrintPreset::matching(self.print_width_cm, self.print_height_cm);
-        self.resize_mode = match workflow.resize_mode.as_str() {
-            "fit" => ResizeMode::Fit,
-            "fill" => ResizeMode::Fill,
-            _ => ResizeMode::NoResize,
-        };
-        self.target_ppi = workflow.target_ppi;
         self.border_mm = workflow.border_mm;
         self.border_style = match workflow.border_style.as_str() {
             "white" => BorderStyle::White,
@@ -1368,13 +1347,6 @@ impl PreprintApp {
             print_height_cm: self.print_height_cm,
             border_mm: self.border_mm,
             length_unit: self.length_unit,
-            resize_mode: match self.resize_mode {
-                ResizeMode::NoResize => "none",
-                ResizeMode::Fit => "fit",
-                ResizeMode::Fill => "fill",
-            }
-            .to_owned(),
-            target_ppi: self.target_ppi,
             border_style: match self.border_style {
                 BorderStyle::White => "white",
                 BorderStyle::Black => "black",
@@ -1576,9 +1548,66 @@ impl PreprintApp {
         format == OutputFormat::Tiff && source == SourceBitDepth::Sixteen
     }
 
+    fn set_preview_zoom_percent(
+        &mut self,
+        percent: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview.set_zoom_percent(percent);
+        if let Some(ui) = &self.ui {
+            ui.preview_zoom.update(cx, |input, cx| {
+                input.set_value(self.preview.zoom_percent().to_string(), window, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn change_preview_zoom(&mut self, direction: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let percent = (i32::from(self.preview.zoom_percent())
+            + direction.signum() * PREVIEW_ZOOM_STEP_PERCENT)
+            .clamp(
+                i32::from(MIN_PREVIEW_ZOOM_PERCENT),
+                i32::from(MAX_PREVIEW_ZOOM_PERCENT),
+            ) as u16;
+        self.set_preview_zoom_percent(percent, window, cx);
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_preview_zoom(1, window, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_preview_zoom(-1, window, cx);
+    }
+
+    fn cancel_input(&mut self, _: &InputEscape, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(original) = self.editing_input_original.take() else {
+            return;
+        };
+        let focused_input = self.ui.as_ref().and_then(|ui| {
+            [
+                &ui.print_width,
+                &ui.print_height,
+                &ui.border_width,
+                &ui.quality_input,
+                &ui.png_compression_input,
+                &ui.preview_zoom,
+            ]
+            .into_iter()
+            .find(|input| input.focus_handle(cx).is_focused(window))
+            .cloned()
+        });
+        if let Some(input) = focused_input {
+            input.update(cx, |input, cx| input.set_value(original, window, cx));
+            window.blur();
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     fn processing_options(&self) -> ProcessingOptions {
         ProcessingOptions::new(self.print_size(), self.border_mm, self.border_style)
-            .with_resizing(self.resize_mode, self.target_ppi)
     }
 
     fn export_options(&self) -> ExportOptions {
@@ -1613,6 +1642,9 @@ impl PreprintApp {
     fn clear_preview_result(&mut self) {
         self.preview_base = None;
         self.preview_softproof = None;
+        self.preview_crop_base = None;
+        self.preview_crop_softproof = None;
+        self.preview_crop_rect = None;
         self.preview_image_size = None;
         self.preview.set_compression_label("");
     }
@@ -1635,20 +1667,8 @@ impl PreprintApp {
         self.clear_preview_result();
     }
 
-    pub(crate) fn close_preview(&mut self) {
-        self.preview.open = false;
-        self.preview.fullscreen = false;
-        if let Some(cancel) = self.preview_cancel.take() {
-            cancel.store(true, Ordering::Release);
-            self.preview_request_id = self.preview_request_id.wrapping_add(1);
-            self.preview.rendering = false;
-            self.preview.set_progress(0.0, tr("idle"));
-        }
-        self.preview_refresh_ready = false;
-    }
-
     fn invalidate_preview_and_refresh(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let should_refresh = self.preview.open && self.selected_file().is_some();
+        let should_refresh = self.selected_file().is_some();
         self.invalidate_preview();
         if !should_refresh {
             return;
@@ -1661,41 +1681,19 @@ impl PreprintApp {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
                 .await;
-            let replacement_window = weak
-                .update(cx, |this, _| {
-                    if preview_refresh_is_current(
-                        request_id,
-                        this.preview_request_id,
-                        this.preview.open,
-                    ) {
-                        this.preview_refresh_ready = true;
-                    }
-                    preview_replacement_can_start(
-                        this.preview_refresh_ready,
-                        this.preview_worker_active,
-                        this.preview.open,
-                        this.selected_file().is_some(),
-                    )
-                    .then_some(this.preview_window)
-                    .flatten()
-                })
-                .ok()
-                .flatten();
-            if let Some(preview_window) = replacement_window {
-                let _ = preview_window.update(cx, |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        if preview_replacement_can_start(
-                            this.preview_refresh_ready,
-                            this.preview_worker_active,
-                            this.preview.open,
-                            this.selected_file().is_some(),
-                        ) {
-                            this.preview_refresh_ready = false;
-                            this.start_preview_render(window, cx, false);
-                        }
-                    });
-                });
-            }
+            let _ = weak.update(cx, |this, cx| {
+                if preview_refresh_is_current(request_id, this.preview_request_id) {
+                    this.preview_refresh_ready = true;
+                }
+                if preview_replacement_can_start(
+                    this.preview_refresh_ready,
+                    this.preview_worker_active,
+                    this.selected_file().is_some(),
+                ) {
+                    this.preview_refresh_ready = false;
+                    this.start_preview_render(cx);
+                }
+            });
         })
         .detach();
     }
@@ -1864,74 +1862,8 @@ impl PreprintApp {
         }
     }
 
-    fn request_preview_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview.open = true;
-        let app = cx.entity();
-        window.defer(cx, move |_, cx| Self::open_preview_window(app, cx));
-        cx.notify();
-    }
-
-    fn open_preview_window(app: Entity<Self>, cx: &mut App) {
-        if let Some(handle) = app.read(cx).preview_window {
-            if handle
-                .update(cx, |_, window, _| window.activate_window())
-                .is_ok()
-            {
-                app.update(cx, |this, cx| {
-                    this.preview.open = true;
-                    cx.notify();
-                });
-                return;
-            }
-            app.update(cx, |this, _| this.preview_window = None);
-        }
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(960.), px(720.)), cx)),
-            window_min_size: Some(size(px(560.), px(420.))),
-            app_id: Some("dev.preprint.app".into()),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some(tr("preview-title").into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let preview_app = app.clone();
-        let result = cx.open_window(options, move |window, cx| {
-            let view = cx.new(|cx| PreviewView::new(preview_app, window, cx));
-            cx.new(|cx| Root::new(view, window, cx))
-        });
-        app.update(cx, |this, cx| match result {
-            Ok(handle) => {
-                this.preview_window = Some(handle.into());
-                this.preview.open = true;
-                cx.notify();
-            }
-            Err(error) => {
-                this.preview.open = false;
-                this.status_message = Some(StatusMessage::error(error.to_string()));
-                cx.notify();
-            }
-        });
-    }
-
-    fn update_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_preview_render(window, cx, true);
-    }
-
-    fn start_preview_render(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        show_window: bool,
-    ) {
+    fn start_preview_render(&mut self, cx: &mut Context<Self>) {
         if self.batch.as_ref().is_some_and(|batch| batch.running) {
-            if show_window {
-                self.status_message =
-                    Some(StatusMessage::error(tr("finish-export-before-preview")));
-                cx.notify();
-            }
             return;
         }
         let Some(path) = self.selected_file().map(Path::to_path_buf) else {
@@ -1940,9 +1872,6 @@ impl PreprintApp {
             return;
         };
 
-        if show_window {
-            self.request_preview_window(window, cx);
-        }
         if self.preview_worker_active {
             if let Some(cancel) = self.preview_cancel.take() {
                 cancel.store(true, Ordering::Release);
@@ -1977,66 +1906,50 @@ impl PreprintApp {
                 .spawn(async move { build_preview(path, processing, export, softproof, cancel) })
                 .await;
 
-            let replacement_window = weak
-                .update(cx, |this, cx| {
-                    this.preview_worker_active = false;
-                    if request_id != this.preview_request_id {
-                        let replacement_window = preview_replacement_can_start(
-                            this.preview_refresh_ready,
-                            this.preview_worker_active,
-                            this.preview.open,
-                            this.selected_file().is_some(),
-                        )
-                        .then_some(this.preview_window)
-                        .flatten();
-                        cx.notify();
-                        return replacement_window;
-                    }
-                    this.preview_cancel = None;
-                    match result {
-                        Ok(PreviewBuildOutcome::Ready(images)) => {
-                            this.preview.mark_finished();
-                            let size = [images.base.width as usize, images.base.height as usize];
-                            this.preview_base = Some(images.base);
-                            this.preview_softproof = images.softproof;
-                            this.preview_image_size = Some(size);
-                            this.preview
-                                .set_compression_label(compression_preview_label(
-                                    &this.export_options(),
-                                ));
-                            this.status_message = Some(StatusMessage::ok(tr("preview-ready")));
-                        }
-                        Ok(PreviewBuildOutcome::Cancelled) => {
-                            this.preview.rendering = false;
-                            this.preview.set_progress(0.0, tr("idle"));
-                        }
-                        Err(error) => {
-                            this.preview.rendering = false;
-                            this.preview.set_progress(0.0, tr("idle"));
-                            this.clear_preview_result();
-                            this.status_message = Some(StatusMessage::error(error));
-                        }
+            let _ = weak.update(cx, |this, cx| {
+                this.preview_worker_active = false;
+                if request_id != this.preview_request_id {
+                    if preview_replacement_can_start(
+                        this.preview_refresh_ready,
+                        this.preview_worker_active,
+                        this.selected_file().is_some(),
+                    ) {
+                        this.preview_refresh_ready = false;
+                        this.start_preview_render(cx);
                     }
                     cx.notify();
-                    None
-                })
-                .ok()
-                .flatten();
-            if let Some(preview_window) = replacement_window {
-                let _ = preview_window.update(cx, |_, window, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        if preview_replacement_can_start(
-                            this.preview_refresh_ready,
-                            this.preview_worker_active,
-                            this.preview.open,
-                            this.selected_file().is_some(),
-                        ) {
-                            this.preview_refresh_ready = false;
-                            this.start_preview_render(window, cx, false);
-                        }
-                    });
-                });
-            }
+                    return;
+                }
+                this.preview_cancel = None;
+                match result {
+                    Ok(PreviewBuildOutcome::Ready(images)) => {
+                        this.preview.mark_finished();
+                        let size = [images.base.width as usize, images.base.height as usize];
+                        this.preview_base = Some(images.base);
+                        this.preview_softproof = images.softproof;
+                        this.preview_crop_base = Some(images.crop_base);
+                        this.preview_crop_softproof = images.crop_softproof;
+                        this.preview_crop_rect = Some(images.crop_rect);
+                        this.preview_image_size = Some(size);
+                        this.preview
+                            .set_compression_label(compression_preview_label(
+                                &this.export_options(),
+                            ));
+                        this.status_message = Some(StatusMessage::ok(tr("preview-ready")));
+                    }
+                    Ok(PreviewBuildOutcome::Cancelled) => {
+                        this.preview.rendering = false;
+                        this.preview.set_progress(0.0, tr("idle"));
+                    }
+                    Err(error) => {
+                        this.preview.rendering = false;
+                        this.preview.set_progress(0.0, tr("idle"));
+                        this.clear_preview_result();
+                        this.status_message = Some(StatusMessage::error(error));
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -2044,6 +1957,17 @@ impl PreprintApp {
     fn start_export(&mut self, cx: &mut Context<Self>) {
         let files = self.files.iter().map(|entry| entry.path.clone()).collect();
         self.start_export_files(files, cx);
+    }
+
+    fn choose_folder_and_export(&mut self, cx: &mut Context<Self>) {
+        if self.output_dir.is_none() {
+            let Some(folder) = FileDialog::new().pick_folder() else {
+                return;
+            };
+            self.output_dir = Some(folder);
+            self.persist_workflow_preferences();
+        }
+        self.start_export(cx);
     }
 
     fn start_export_files(&mut self, files: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -2267,12 +2191,25 @@ impl PreprintApp {
             .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
     }
 
+    fn number_input_with_tooltip(
+        &self,
+        id: &'static str,
+        input: NumberInput,
+        value: impl Into<SharedString>,
+    ) -> impl IntoElement {
+        let value: SharedString = value.into();
+        div()
+            .id(id)
+            .tooltip(move |window, cx| Tooltip::new(value.clone()).build(window, cx))
+            .child(input)
+    }
+
     fn card(
         &self,
         title: impl Into<SharedString>,
         content: impl IntoElement,
         cx: &App,
-    ) -> impl IntoElement {
+    ) -> gpui::Div {
         let title: SharedString = title.into();
         v_flex()
             .gap_3()
@@ -2295,53 +2232,19 @@ impl PreprintApp {
         let value: SharedString = value.into();
         div()
             .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .child(div().min_w(px(120.)).text_sm().child(label))
-            .child(div().flex_1().text_sm().child(value))
+            .flex_col()
+            .items_start()
+            .gap_1()
+            .child(div().text_sm().font_medium().child(label))
+            .when(!value.is_empty(), |row| {
+                row.child(div().w_full().truncate().text_sm().child(value))
+            })
             .child(controls)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let export_running = self.batch.as_ref().is_some_and(|batch| batch.running);
-        let preview_ready =
-            self.selected_file().is_some() && !self.preview_worker_active && !export_running;
         let ui = self.ui.as_ref().expect("PreprintApp::new initializes UI");
-        let export_disabled = self.files.is_empty()
-            || self.output_dir.is_none()
-            || export_running
-            || self.preview_worker_active
-            || self.importing;
-        let export_reason = if self.preview_worker_active {
-            Some(tr("preview-in-progress"))
-        } else if self.importing {
-            Some(tr("import-in-progress"))
-        } else if self.output_dir.is_none() {
-            Some(tr("pick-output-folder"))
-        } else if self.files.is_empty() {
-            Some(tr("add-images-to-export"))
-        } else {
-            None
-        };
-        let mut export_button = self
-            .button(
-                "export",
-                if export_running {
-                    tr("exporting")
-                } else {
-                    tr("export-all")
-                },
-                IconName::ExternalLink,
-                cx,
-                |this, _, cx| this.start_export(cx),
-            )
-            .primary()
-            .disabled(export_disabled)
-            .loading(export_running);
-        if let Some(reason) = export_reason {
-            export_button = export_button.tooltip(reason);
-        }
         let mut actions = div().flex().items_center().gap_2();
         let update_control = match &self.update {
             AppUpdateState::Available(update) => Some((
@@ -2398,19 +2301,7 @@ impl PreprintApp {
                         cx.refresh_windows();
                         cx.notify();
                     })),
-            )
-            .child(
-                self.button(
-                    "preview",
-                    tr("preview"),
-                    IconName::Eye,
-                    cx,
-                    |this, window, cx| this.update_preview(window, cx),
-                )
-                .disabled(!preview_ready)
-                .loading(self.preview_worker_active),
-            )
-            .child(export_button);
+            );
 
         div()
             .flex()
@@ -2441,13 +2332,14 @@ impl PreprintApp {
         let queue_locked = self.queue_locked();
         let mut list = v_flex()
             .id("files-list")
-            .gap_1()
-            .max_h(px(250.))
+            .flex_1()
+            .min_h(px(0.))
+            .gap_2()
             .overflow_y_scroll();
         if self.files.is_empty() {
             list = list.child(
                 div()
-                    .h(px(130.))
+                    .flex_1()
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2465,20 +2357,118 @@ impl PreprintApp {
                     .and_then(|name| name.to_str())
                     .map_or_else(|| tr("image-fallback-name"), str::to_owned);
                 let selected = self.selected_index == index;
-                let status = entry.status_label();
-                list = list.child(
-                    Button::new(("file", index))
-                        .icon(IconName::File)
-                        .label(format!("{name}  {status}"))
-                        .selected(selected)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.selected_index = index;
-                            this.invalidate_preview_and_refresh(window, cx);
-                            this.normalize_bit_depth_choice();
-                            this.sync_bit_depth_select(window, cx);
-                            cx.notify();
-                        })),
-                );
+                let (primary_metadata, secondary_metadata) = entry.metadata_lines();
+                let readiness = entry.print_readiness(self.print_size());
+                let thumbnail_size = entry
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.dimensions)
+                    .map(|dimensions| fitted_thumbnail_size(dimensions, THUMBNAIL_DISPLAY_SIZE));
+                let thumbnail: AnyElement = entry
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.thumbnail.clone())
+                    .map_or_else(
+                        || {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(Icon::new(IconName::File).size(px(24.)))
+                                .into_any_element()
+                        },
+                        |thumbnail| {
+                            let (width, height) = thumbnail_size
+                                .unwrap_or((THUMBNAIL_DISPLAY_SIZE, THUMBNAIL_DISPLAY_SIZE));
+                            gpui::img(thumbnail)
+                                .w(px(width))
+                                .h(px(height))
+                                .into_any_element()
+                        },
+                    );
+                let mut row = div()
+                    .id(("file", index))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(THUMBNAIL_DISPLAY_SIZE))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .rounded_sm()
+                            .bg(cx.theme().muted)
+                            .child(thumbnail),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap_1()
+                            .child(div().truncate().font_semibold().text_sm().child(name))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(primary_metadata),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(secondary_metadata),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(if readiness.warning {
+                                        cx.theme().danger
+                                    } else if readiness.ready {
+                                        cx.theme().success
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(Icon::new(if readiness.warning {
+                                        IconName::TriangleAlert
+                                    } else if readiness.ready {
+                                        IconName::CircleCheck
+                                    } else {
+                                        IconName::LoaderCircle
+                                    }))
+                                    .child(readiness.label),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.selected_index = index;
+                        this.invalidate_preview_and_refresh(window, cx);
+                        this.normalize_bit_depth_choice();
+                        this.sync_bit_depth_select(window, cx);
+                        cx.notify();
+                    }));
+                if selected {
+                    row = row
+                        .bg(cx.theme().list_active)
+                        .border_color(cx.theme().list_active_border);
+                } else {
+                    row = row
+                        .border_color(cx.theme().border)
+                        .hover(|style| style.bg(cx.theme().list_hover));
+                }
+                list = list.child(row);
             }
         }
 
@@ -2509,10 +2499,16 @@ impl PreprintApp {
                 |this, window, cx| this.remove_selected_file(window, cx),
             )
             .disabled(queue_locked || self.files.is_empty());
-        let clear = Button::new("clear-images")
-            .label(tr("clear-all"))
-            .disabled(queue_locked || self.files.is_empty())
-            .on_click(cx.listener(|this, _, window, cx| this.clear_files(window, cx)));
+        let clear = self
+            .button(
+                "clear-images",
+                tr("clear-all"),
+                IconName::Delete,
+                cx,
+                |this, window, cx| this.clear_files(window, cx),
+            )
+            .ghost()
+            .disabled(queue_locked || self.files.is_empty());
         let actions = div()
             .flex()
             .flex_wrap()
@@ -2522,26 +2518,46 @@ impl PreprintApp {
             .child(remove)
             .child(clear);
         self.card(
-            tr("card-input-files"),
-            v_flex().gap_3().child(actions).child(list),
+            tr("card-photo-queue"),
+            v_flex()
+                .flex_1()
+                .min_h(px(0.))
+                .gap_3()
+                .child(actions)
+                .child(list),
             cx,
         )
+        .h_full()
     }
 
     fn render_print(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ppi = self.ppi_label();
         let ui = self.ui.as_ref().expect("PreprintApp::new initializes UI");
-        let width = NumberInput::new(&ui.print_width)
-            .suffix(self.length_unit.suffix())
-            .w(px(180.));
-        let height = NumberInput::new(&ui.print_height)
-            .suffix(self.length_unit.suffix())
-            .w(px(180.));
+        let unit_suffix = self.length_unit.suffix();
+        let width_value = format!("{} {unit_suffix}", ui.print_width.read(cx).value());
+        let height_value = format!("{} {unit_suffix}", ui.print_height.read(cx).value());
+        let border_value = format!("{} mm", ui.border_width.read(cx).value());
+        let width = self.number_input_with_tooltip(
+            "print-width-control",
+            NumberInput::new(&ui.print_width)
+                .suffix(unit_suffix)
+                .w(px(156.)),
+            width_value,
+        );
+        let height = self.number_input_with_tooltip(
+            "print-height-control",
+            NumberInput::new(&ui.print_height)
+                .suffix(unit_suffix)
+                .w(px(156.)),
+            height_value,
+        );
         let unit = Select::new(&ui.length_unit).w(px(180.));
         let preset = Select::new(&ui.print_preset).w(px(180.));
-        let resize = Select::new(&ui.resize_mode).w(px(180.));
-        let target_ppi = NumberInput::new(&ui.target_ppi).suffix("PPI").w(px(180.));
-        let border = NumberInput::new(&ui.border_width).suffix("mm").w(px(180.));
+        let border = self.number_input_with_tooltip(
+            "border-width-control",
+            NumberInput::new(&ui.border_width).suffix("mm").w(px(156.)),
+            border_value,
+        );
         let style = Select::new(&ui.border_style).w(px(180.));
         let swap = self.button(
             "swap-orientation",
@@ -2551,18 +2567,25 @@ impl PreprintApp {
             |this, window, cx| this.swap_print_orientation(window, cx),
         );
 
-        let mut rows = v_flex()
-            .gap_2()
+        let rows = v_flex()
+            .gap_3()
             .child(self.value_row(tr("preset"), "", preset))
             .child(self.value_row(tr("units"), "", unit))
-            .child(self.value_row(tr("target-size"), tr("width"), width))
-            .child(self.value_row("", tr("height"), height))
+            .child(
+                self.value_row(
+                    tr("target-size"),
+                    "",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(width)
+                        .child("×")
+                        .child(height),
+                ),
+            )
             .child(self.value_row(tr("orientation"), "", swap))
-            .child(self.value_row(tr("resize-mode"), "", resize));
-        if self.resize_mode != ResizeMode::NoResize {
-            rows = rows.child(self.value_row(tr("target-ppi"), "", target_ppi));
-        }
-        rows = rows
+            .child(self.value_row(tr("sizing"), "", div().text_sm().child(tr("crop-to-fit"))))
             .child(self.value_row(tr("border-width"), "", border))
             .child(self.value_row(tr("border-style"), "", style))
             .child(
@@ -2611,30 +2634,54 @@ impl PreprintApp {
             );
         let tiff = Select::new(&ui.tiff_compression).w(px(180.));
         let deflate = Select::new(&ui.tiff_deflate_level).w(px(180.));
+        let advanced = self
+            .button(
+                "toggle-advanced",
+                tr("advanced-settings"),
+                if self.advanced_open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                },
+                cx,
+                |this, _, cx| {
+                    this.advanced_open = !this.advanced_open;
+                    cx.notify();
+                },
+            )
+            .ghost()
+            .selected(self.advanced_open);
 
         let mut rows = v_flex()
-            .gap_2()
+            .gap_3()
             .child(self.value_row(tr("save-to"), folder, folder_button))
-            .child(self.value_row(tr("format"), "", format));
-        if self.output_format == OutputFormat::Jpeg {
-            rows = rows.child(self.value_row(tr("quality"), "", quality));
-        } else {
-            rows = rows.child(self.value_row(tr("bit-depth"), "", depth));
-            if self.output_format == OutputFormat::Png {
-                rows = rows.child(self.value_row(tr("effort"), "", png));
+            .child(self.value_row(tr("format"), "", format))
+            .child(advanced);
+        if self.advanced_open {
+            if self.output_format == OutputFormat::Jpeg {
+                rows = rows.child(self.value_row(tr("quality"), "", quality));
             } else {
-                rows = rows.child(self.value_row(tr("compression"), "", tiff));
-                if self.tiff_compression == TiffCompression::Deflate {
-                    rows = rows.child(self.value_row(tr("effort"), "", deflate));
+                rows = rows.child(self.value_row(tr("bit-depth"), "", depth));
+                if self.output_format == OutputFormat::Png {
+                    rows = rows.child(self.value_row(tr("compression-optimization"), "", png));
+                } else {
+                    rows = rows.child(self.value_row(tr("compression"), "", tiff));
+                    if self.tiff_compression == TiffCompression::Deflate {
+                        rows = rows.child(self.value_row(
+                            tr("compression-optimization"),
+                            tr("compression-optimization-help"),
+                            deflate,
+                        ));
+                    }
                 }
             }
+            rows = rows.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.bit_depth_note()),
+            );
         }
-        rows = rows.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(self.bit_depth_note()),
-        );
         self.card(tr("card-output"), rows, cx)
     }
 
@@ -2689,65 +2736,8 @@ impl PreprintApp {
             )
             .selected(self.convert_output_profile)
             .disabled(self.softproof.profile_path().is_none());
-        let refresh = self
-            .button(
-                "refresh",
-                tr("refresh-preview"),
-                IconName::Redo2,
-                cx,
-                |this, window, cx| this.start_preview_render(window, cx, false),
-            )
-            .disabled(
-                self.selected_file().is_none()
-                    || self.preview_worker_active
-                    || self.batch.as_ref().is_some_and(|batch| batch.running),
-            )
-            .loading(self.preview_worker_active);
-        let show = self
-            .button(
-                "show",
-                tr("show-window"),
-                IconName::Maximize,
-                cx,
-                |this, window, cx| this.request_preview_window(window, cx),
-            )
-            .disabled(self.preview_base.is_none() && !self.preview.rendering);
-        let mut info = v_flex().gap_1();
-        if self.preview.open {
-            info = info.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(tr("live-preview-enabled")),
-            );
-        }
-        if self.preview.rendering {
-            info = info
-                .child(Progress::new().value(self.preview.progress() * 100.0))
-                .child(
-                    div()
-                        .text_sm()
-                        .child(self.preview.progress_label().to_owned()),
-                );
-        }
-        if let Some(size) = self.preview_image_size {
-            info = info.child(div().text_sm().child(format!(
-                "{}: {} x {} px",
-                tr("preview"),
-                size[0],
-                size[1]
-            )));
-        }
-        if !self.preview.compression_label().is_empty() {
-            info = info.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.preview.compression_label().to_owned()),
-            );
-        }
         self.card(
-            tr("card-preview"),
+            tr("card-color-management"),
             v_flex()
                 .gap_3()
                 .child(self.value_row(
@@ -2755,11 +2745,320 @@ impl PreprintApp {
                     profile,
                     div().flex().gap_1().child(choose).child(clear),
                 ))
-                .child(self.value_row(tr("output-profile"), "", convert_output))
-                .child(info)
-                .child(div().flex().gap_2().child(refresh).child(show)),
+                .child(self.value_row(tr("output-profile"), "", convert_output)),
             cx,
         )
+    }
+
+    fn render_workspace_preview(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let crop_image = if self.preview.softproof_enabled() {
+            self.preview_crop_softproof
+                .clone()
+                .or(self.preview_crop_base.clone())
+        } else {
+            self.preview_crop_base.clone()
+        };
+        let crop_overlay_available = self
+            .preview_crop_rect
+            .zip(crop_image.as_ref())
+            .is_some_and(|(crop, image)| crop.width != image.width || crop.height != image.height);
+        let image = if self.preview.crop_overlay_enabled() && crop_overlay_available {
+            crop_image
+        } else if self.preview.softproof_enabled() {
+            self.preview_softproof.clone().or(self.preview_base.clone())
+        } else {
+            self.preview_base.clone()
+        };
+        let crop_rect = (self.preview.crop_overlay_enabled() && crop_overlay_available)
+            .then_some(self.preview_crop_rect)
+            .flatten();
+        let softproof_available = self.preview_softproof.is_some();
+        let ui = self.ui.as_ref().expect("PreprintApp::new initializes UI");
+        let selected_name = self.selected_file().map_or_else(
+            || tr("no-image-selected"),
+            |path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Image")
+                    .to_owned()
+            },
+        );
+
+        let softproof = Button::new("workspace-softproof")
+            .icon(if self.preview.softproof_enabled() {
+                IconName::Eye
+            } else {
+                IconName::EyeOff
+            })
+            .selected(self.preview.softproof_enabled() && softproof_available)
+            .disabled(!softproof_available)
+            .tooltip(if softproof_available {
+                tr("toggle-softproof")
+            } else {
+                tr("no-softproof-profile")
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.preview
+                    .set_softproof_enabled(!this.preview.softproof_enabled());
+                cx.notify();
+            }));
+        let crop = Button::new("workspace-crop")
+            .icon(IconName::Frame)
+            .tooltip(tr("crop-overlay"))
+            .selected(self.preview.crop_overlay_enabled())
+            .disabled(!crop_overlay_available)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.preview
+                    .set_crop_overlay_enabled(!this.preview.crop_overlay_enabled());
+                cx.notify();
+            }));
+        let refresh = Button::new("workspace-refresh")
+            .icon(IconName::Redo2)
+            .tooltip(tr("refresh-preview"))
+            .disabled(
+                self.selected_file().is_none()
+                    || self.preview_worker_active
+                    || self.batch.as_ref().is_some_and(|batch| batch.running),
+            )
+            .loading(self.preview_worker_active)
+            .on_click(cx.listener(|this, _, _, cx| this.start_preview_render(cx)));
+        let zoom_input = NumberInput::new(&ui.preview_zoom).suffix("%").w(px(140.));
+        let is_fullscreen = window.is_fullscreen();
+        let fullscreen = Button::new("workspace-fullscreen")
+            .icon(if is_fullscreen {
+                IconName::Minimize
+            } else {
+                IconName::Maximize
+            })
+            .tooltip(if is_fullscreen {
+                tr("exit-fullscreen")
+            } else {
+                tr("fullscreen")
+            })
+            .ghost()
+            .on_click(cx.listener(|_, _, window, cx| {
+                window.toggle_fullscreen();
+                cx.notify();
+            }));
+
+        let content: AnyElement = if self.preview.rendering {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    Progress::new()
+                        .w(px(280.))
+                        .value(self.preview.progress() * 100.0),
+                )
+                .child(self.preview.progress_label().to_owned())
+                .into_any_element()
+        } else if let Some(image) = image {
+            div()
+                .id("preview-stage")
+                .flex_1()
+                .min_h(px(0.))
+                .p_5()
+                .overflow_hidden()
+                .bg(cx.theme().muted)
+                .child(print_preview_canvas(
+                    image,
+                    crop_rect,
+                    f32::from(self.preview.zoom_percent()) / 100.0,
+                ))
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                    let direction = scroll_zoom_direction(event.delta);
+                    if direction != 0 {
+                        cx.stop_propagation();
+                        this.change_preview_zoom(direction, window, cx);
+                    }
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(cx.theme().muted_foreground)
+                .child(Icon::new(IconName::Frame).size(px(36.)))
+                .child(if self.files.is_empty() {
+                    tr("add-images-for-preview")
+                } else {
+                    tr("preparing-live-preview")
+                })
+                .into_any_element()
+        };
+
+        v_flex()
+            .size_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        v_flex()
+                            .min_w(px(0.))
+                            .child(div().font_semibold().child(tr("live-print-preview")))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(selected_name),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(softproof)
+                            .child(crop)
+                            .child(refresh)
+                            .child(zoom_input)
+                            .child(fullscreen),
+                    ),
+            )
+            .child(content)
+            .child(
+                div()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.ppi_label()),
+                    ),
+            )
+    }
+
+    fn render_inspector_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                v_flex()
+                    .child(div().font_semibold().child(tr("settings")))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(tr("settings-apply-batch")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary)
+                    .text_sm()
+                    .font_medium()
+                    .child(Icon::new(IconName::GalleryVerticalEnd))
+                    .child(rust_i18n::t!("all-photos", count = self.files.len()).into_owned()),
+            )
+    }
+
+    fn render_export_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let export_running = self.batch.as_ref().is_some_and(|batch| batch.running);
+        let disabled =
+            self.files.is_empty() || export_running || self.preview_worker_active || self.importing;
+        let blocker = if self.preview_worker_active {
+            Some(tr("preview-in-progress"))
+        } else if self.importing {
+            Some(tr("import-in-progress"))
+        } else if self.files.is_empty() {
+            Some(tr("add-images-to-export"))
+        } else if self.output_dir.is_none() {
+            Some(tr("choose-folder-to-export"))
+        } else {
+            None
+        };
+        let (ready, warnings) = self.readiness_counts();
+        let summary = rust_i18n::t!(
+            "workflow-summary",
+            total = self.files.len(),
+            ready = ready,
+            warnings = warnings
+        )
+        .into_owned();
+        let label = if export_running {
+            tr("exporting")
+        } else if self.output_dir.is_none() && !self.files.is_empty() {
+            tr("choose-folder-and-export")
+        } else {
+            rust_i18n::t!("export-photos", count = self.files.len()).into_owned()
+        };
+        let mut action = self
+            .button(
+                "export",
+                label,
+                IconName::ExternalLink,
+                cx,
+                |this, _, cx| this.choose_folder_and_export(cx),
+            )
+            .primary()
+            .disabled(disabled)
+            .loading(export_running);
+        if let Some(reason) = blocker.clone() {
+            action = action.tooltip(reason);
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .child(
+                v_flex()
+                    .child(div().text_sm().font_semibold().child(summary))
+                    .when_some(blocker, |view, reason| {
+                        view.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(reason),
+                        )
+                    }),
+            )
+            .child(action)
     }
 
     fn render_export_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2895,32 +3194,10 @@ impl PreprintApp {
         let Some((width, height)) = status.dimensions else {
             return tr("ppi-dimensions-unavailable");
         };
-        if self.resize_mode != ResizeMode::NoResize {
-            return match target_pixel_dimensions(self.print_size(), self.target_ppi) {
-                Ok((output_width, output_height)) => {
-                    let aspect_note = if aspect_ratio_warning(width, height, self.print_size()) {
-                        tr(match self.resize_mode {
-                            ResizeMode::Fit => "resize-fit-aspect-note",
-                            ResizeMode::Fill => "resize-fill-aspect-note",
-                            ResizeMode::NoResize => unreachable!(),
-                        })
-                    } else {
-                        String::new()
-                    };
-                    rust_i18n::t!(
-                        "ppi-resized-output",
-                        width = output_width,
-                        height = output_height,
-                        ppi = self.target_ppi,
-                        note = aspect_note
-                    )
-                    .into_owned()
-                }
-                Err(error) => error.to_string(),
-            };
-        }
-        match calculate_ppi(width, height, self.print_size()) {
-            Ok(ppi) => {
+        match crop_rect(width, height, self.print_size()).and_then(|crop| {
+            calculate_ppi(crop.width, crop.height, self.print_size()).map(|ppi| (crop, ppi))
+        }) {
+            Ok((crop, ppi)) => {
                 let quality = if ppi.x.min(ppi.y) < 150.0 {
                     tr("ppi-quality-low")
                 } else if ppi.x.min(ppi.y) < 300.0 {
@@ -2928,15 +3205,34 @@ impl PreprintApp {
                 } else {
                     tr("ppi-quality-sharp")
                 };
-                let warning = if aspect_ratio_warning(width, height, self.print_size()) {
-                    format!("  {}", tr("ppi-aspect-warning-none"))
+                let note = if crop.width != width || crop.height != height {
+                    tr("ppi-crop-note")
                 } else {
                     String::new()
                 };
-                format!("PPI {:.0} x {:.0}: {quality}{warning}", ppi.x, ppi.y)
+                rust_i18n::t!(
+                    "ppi-cropped-output",
+                    width = crop.width,
+                    height = crop.height,
+                    ppi_x = format!("{:.0}", ppi.x),
+                    ppi_y = format!("{:.0}", ppi.y),
+                    quality = quality,
+                    note = note
+                )
+                .into_owned()
             }
             Err(error) => error.to_string(),
         }
+    }
+
+    fn readiness_counts(&self) -> (usize, usize) {
+        self.files.iter().fold((0, 0), |(ready, warnings), entry| {
+            let readiness = entry.print_readiness(self.print_size());
+            (
+                ready + usize::from(readiness.ready),
+                warnings + usize::from(readiness.warning),
+            )
+        })
     }
 
     fn bit_depth_note(&self) -> String {
@@ -2951,13 +3247,44 @@ impl PreprintApp {
 }
 
 impl Render for PreprintApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if window.is_fullscreen() {
+            return div()
+                .id("preprint-root")
+                .on_action(cx.listener(Self::zoom_in))
+                .on_action(cx.listener(Self::zoom_out))
+                .on_action(cx.listener(Self::cancel_input))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, window, cx| {
+                        if !window.default_prevented() {
+                            window.blur();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .size_full()
+                .overflow_hidden()
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
+                .child(self.render_workspace_preview(window, cx));
+        }
+
+        let (ready, warnings) = self.readiness_counts();
         let status: AnyElement = self.status_message.as_ref().map_or_else(
             || {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(i18n::plural("files-loaded", self.files.len()))
+                    .child(
+                        rust_i18n::t!(
+                            "workflow-summary",
+                            total = self.files.len(),
+                            ready = ready,
+                            warnings = warnings
+                        )
+                        .into_owned(),
+                    )
                     .into_any_element()
             },
             |message| {
@@ -2983,14 +3310,26 @@ impl Render for PreprintApp {
 
         div()
             .id("preprint-root")
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::cancel_input))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, cx| {
+                    if !window.default_prevented() {
+                        window.blur();
+                        cx.notify();
+                    }
+                }),
+            )
             .size_full()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .p_5()
+            .p_4()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.append_paths(paths.paths().to_vec(), window, cx)
             }))
@@ -2998,27 +3337,51 @@ impl Render for PreprintApp {
             .child(status)
             .child(
                 div()
+                    .flex_1()
+                    .min_h(px(0.))
                     .flex()
-                    .gap_4()
-                    .items_start()
+                    .gap_3()
                     .child(
                         v_flex()
-                            .flex_1()
-                            .min_w(px(360.))
-                            .gap_4()
-                            .child(self.render_files(cx))
-                            .child(self.render_export_status(cx)),
+                            .w(px(300.))
+                            .flex_none()
+                            .h_full()
+                            .min_h(px(0.))
+                            .child(self.render_files(cx)),
                     )
                     .child(
                         v_flex()
+                            .id("preview-workspace")
                             .flex_1()
-                            .min_w(px(420.))
-                            .gap_4()
+                            .h_full()
+                            .min_h(px(0.))
+                            .min_w(px(320.))
+                            .child(self.render_workspace_preview(window, cx)),
+                    )
+                    .child(
+                        v_flex()
+                            .id("settings-column")
+                            .w(px(380.))
+                            .flex_none()
+                            .h_full()
+                            .min_h(px(0.))
+                            .gap_3()
+                            .overflow_y_scroll()
+                            .child(self.render_inspector_header(cx))
                             .child(self.render_print(cx))
                             .child(self.render_output(cx))
                             .child(self.render_preview_card(cx)),
                     ),
             )
+            .when(self.batch.is_some(), |root| {
+                root.child(
+                    div()
+                        .w_full()
+                        .flex_none()
+                        .child(self.render_export_status(cx)),
+                )
+            })
+            .child(self.render_export_bar(cx))
     }
 }
 
@@ -3029,19 +3392,115 @@ struct FileEntry {
 }
 
 impl FileEntry {
-    fn status_label(&self) -> String {
+    fn metadata_lines(&self) -> (String, String) {
         let Some(status) = &self.status else {
-            return tr("entry-inspecting");
+            return (tr("entry-inspecting"), String::new());
         };
         if let Some(error) = &status.error {
-            return rust_i18n::t!("entry-error", error = error.as_str()).into_owned();
+            return (
+                rust_i18n::t!("entry-error", error = error.as_str()).into_owned(),
+                String::new(),
+            );
         }
-        match (status.dimensions, status.bit_depth) {
-            (Some((width, height)), Some(depth)) => {
-                format!("{width} x {height}px, {}", depth.label())
-            }
-            (Some((width, height)), None) => format!("{width} x {height}px"),
-            _ => tr("entry-ready"),
+        let format = status
+            .format
+            .map(image_format_label)
+            .unwrap_or_else(|| tr("entry-format-unknown"));
+        let primary = status.dimensions.map_or_else(
+            || format.clone(),
+            |(width, height)| {
+                let megapixels = f64::from(width) * f64::from(height) / 1_000_000.0;
+                format!(
+                    "{format} · {} · {width} × {height} px · {megapixels:.1} MP",
+                    aspect_ratio_label(width, height)
+                )
+            },
+        );
+        let secondary = match (&status.color_space, status.bit_depth) {
+            (Some(color_space), Some(depth)) => format!("{color_space} · {}", depth.label()),
+            (Some(color_space), None) => color_space.clone(),
+            (None, Some(depth)) => depth.label(),
+            (None, None) => tr("entry-ready"),
+        };
+        (primary, secondary)
+    }
+
+    fn print_readiness(&self, print_size: PrintSizeMm) -> PrintReadiness {
+        let Some(status) = &self.status else {
+            return PrintReadiness::pending(tr("entry-inspecting"));
+        };
+        if status.error.is_some() {
+            return PrintReadiness::warning(tr("entry-needs-attention"));
+        }
+        let Some((width, height)) = status.dimensions else {
+            return PrintReadiness::warning(tr("ppi-dimensions-unavailable"));
+        };
+        let Ok(crop) = crop_rect(width, height, print_size) else {
+            return PrintReadiness::warning(tr("entry-needs-attention"));
+        };
+        let Ok(ppi) = calculate_ppi(crop.width, crop.height, print_size) else {
+            return PrintReadiness::warning(tr("entry-needs-attention"));
+        };
+        let ppi = ppi.x.min(ppi.y).round();
+        let (quality, warning) = if ppi < 150.0 {
+            (tr("quality-low"), true)
+        } else if ppi < 300.0 {
+            (tr("quality-good"), false)
+        } else {
+            (tr("quality-excellent"), false)
+        };
+        let cropped = crop.width != width || crop.height != height;
+        let label = if cropped {
+            rust_i18n::t!(
+                "entry-print-status-cropped",
+                ppi = format!("{ppi:.0}"),
+                quality = quality
+            )
+            .into_owned()
+        } else {
+            rust_i18n::t!(
+                "entry-print-status",
+                ppi = format!("{ppi:.0}"),
+                quality = quality
+            )
+            .into_owned()
+        };
+        if warning {
+            PrintReadiness::warning(label)
+        } else {
+            PrintReadiness::ready(label)
+        }
+    }
+}
+
+struct PrintReadiness {
+    label: String,
+    ready: bool,
+    warning: bool,
+}
+
+impl PrintReadiness {
+    fn ready(label: String) -> Self {
+        Self {
+            label,
+            ready: true,
+            warning: false,
+        }
+    }
+
+    fn warning(label: String) -> Self {
+        Self {
+            label,
+            ready: false,
+            warning: true,
+        }
+    }
+
+    fn pending(label: String) -> Self {
+        Self {
+            label,
+            ready: false,
+            warning: false,
         }
     }
 }
@@ -3050,6 +3509,9 @@ impl FileEntry {
 struct FileStatus {
     dimensions: Option<(u32, u32)>,
     bit_depth: Option<SourceBitDepth>,
+    format: Option<ImageFormat>,
+    color_space: Option<String>,
+    thumbnail: Option<Arc<gpui::Image>>,
     error: Option<String>,
 }
 
@@ -3083,6 +3545,9 @@ impl StatusMessage {
 struct PreviewImages {
     base: PreviewBitmap,
     softproof: Option<PreviewBitmap>,
+    crop_base: PreviewBitmap,
+    crop_softproof: Option<PreviewBitmap>,
+    crop_rect: CropRect,
 }
 
 enum PreviewBuildOutcome {
@@ -3248,10 +3713,24 @@ fn integer_input_is_valid(value: &str, max: u8) -> bool {
                 .is_ok_and(|value| value <= u16::from(max)))
 }
 
-fn unsigned_input_is_valid(value: &str, max: u32) -> bool {
+fn preview_zoom_input_is_valid(value: &str) -> bool {
     value.is_empty()
         || (value.chars().all(|character| character.is_ascii_digit())
-            && value.parse::<u32>().is_ok_and(|value| value <= max))
+            && value
+                .parse::<u16>()
+                .is_ok_and(|percent| percent <= MAX_PREVIEW_ZOOM_PERCENT))
+}
+
+fn scroll_zoom_direction(delta: ScrollDelta) -> i32 {
+    let vertical = match delta {
+        ScrollDelta::Pixels(delta) => f32::from(delta.y),
+        ScrollDelta::Lines(delta) => delta.y,
+    };
+    match vertical.total_cmp(&0.0) {
+        std::cmp::Ordering::Greater => 1,
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+    }
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -3384,18 +3863,133 @@ fn import_summary(added: usize, duplicates: usize, skipped: usize, limited: usiz
 }
 
 fn inspect_file(path: &Path) -> FileStatus {
-    match load_image_metadata(path) {
-        Ok(metadata) => FileStatus {
-            dimensions: Some(metadata.dimensions),
-            bit_depth: Some(metadata.bit_depth),
+    match load_image(path).and_then(|loaded| {
+        let dimensions = (loaded.image.width(), loaded.image.height());
+        let color_space = source_color_space(&loaded.image, loaded.icc_profile.as_deref());
+        let thumbnail = build_file_thumbnail(&loaded.image, loaded.icc_profile.as_deref())
+            .map_err(|error| crate::loader::LoadImageError::Rejected {
+                path: path.to_path_buf(),
+                reason: format!("failed to build thumbnail: {error}"),
+            })?;
+        Ok((loaded, dimensions, color_space, thumbnail))
+    }) {
+        Ok((loaded, dimensions, color_space, thumbnail)) => FileStatus {
+            dimensions: Some(dimensions),
+            bit_depth: Some(loaded.bit_depth),
+            format: loaded.format,
+            color_space: Some(color_space),
+            thumbnail: Some(thumbnail),
             error: None,
         },
         Err(error) => FileStatus {
             dimensions: None,
             bit_depth: None,
+            format: None,
+            color_space: None,
+            thumbnail: None,
             error: Some(error.to_string()),
         },
     }
+}
+
+fn build_file_thumbnail(
+    image: &DynamicImage,
+    source_icc_profile: Option<&[u8]>,
+) -> Result<Arc<gpui::Image>> {
+    let thumbnail = image.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
+    let thumbnail = if source_icc_profile.is_some() {
+        apply_source_profile_to_srgb(&thumbnail, source_icc_profile)
+            .context("failed to color-manage thumbnail")?
+    } else {
+        thumbnail
+    };
+    let thumbnail = DynamicImage::ImageRgba8(thumbnail.to_rgba8());
+    let mut encoded = io::Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut encoded, ImageFormat::Png)
+        .context("failed to encode thumbnail")?;
+    Ok(Arc::new(gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        encoded.into_inner(),
+    )))
+}
+
+fn source_color_space(image: &DynamicImage, source_icc_profile: Option<&[u8]>) -> String {
+    if !image.color().has_color() {
+        return tr("entry-grayscale");
+    }
+    let Some(profile) = source_icc_profile else {
+        return tr("entry-srgb-assumed");
+    };
+    Profile::new_icc(profile)
+        .ok()
+        .and_then(|profile| profile.info(InfoType::Description, Locale::none()))
+        .filter(|description| !description.trim().is_empty())
+        .unwrap_or_else(|| tr("entry-embedded-rgb"))
+}
+
+fn image_format_label(format: ImageFormat) -> String {
+    match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::Gif => "GIF",
+        ImageFormat::WebP => "WebP",
+        ImageFormat::Pnm => "PNM",
+        ImageFormat::Tiff => "TIFF",
+        ImageFormat::Tga => "TGA",
+        ImageFormat::Dds => "DDS",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Ico => "ICO",
+        ImageFormat::Hdr => "HDR",
+        ImageFormat::OpenExr => "OpenEXR",
+        ImageFormat::Farbfeld => "farbfeld",
+        ImageFormat::Avif => "AVIF",
+        ImageFormat::Qoi => "QOI",
+        _ => return tr("entry-format-unknown"),
+    }
+    .to_owned()
+}
+
+fn aspect_ratio_label(width: u32, height: u32) -> String {
+    if width == 0 || height == 0 {
+        return "-".to_owned();
+    }
+    const COMMON_RATIOS: &[(u32, u32)] = &[
+        (1, 1),
+        (5, 4),
+        (4, 3),
+        (7, 5),
+        (3, 2),
+        (8, 5),
+        (5, 3),
+        (16, 9),
+        (2, 1),
+        (21, 9),
+    ];
+    let landscape = width >= height;
+    let ratio = f64::from(width.max(height)) / f64::from(width.min(height));
+    let &(ratio_width, ratio_height) = COMMON_RATIOS
+        .iter()
+        .min_by(|left, right| {
+            let left_distance = (ratio - f64::from(left.0) / f64::from(left.1)).abs();
+            let right_distance = (ratio - f64::from(right.0) / f64::from(right.1)).abs();
+            left_distance.total_cmp(&right_distance)
+        })
+        .expect("common aspect ratios must not be empty");
+    if landscape {
+        format!("{ratio_width}:{ratio_height}")
+    } else {
+        format!("{ratio_height}:{ratio_width}")
+    }
+}
+
+fn fitted_thumbnail_size(dimensions: (u32, u32), maximum: f32) -> (f32, f32) {
+    let (width, height) = dimensions;
+    if width == 0 || height == 0 || maximum <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let scale = (maximum / width as f32).min(maximum / height as f32);
+    (width as f32 * scale, height as f32 * scale)
 }
 
 fn build_preview(
@@ -3416,17 +4010,34 @@ fn build_preview(
     }
     let source_icc_profile = loaded.icc_profile;
     let image = downscale_for_preview(loaded.image);
-    let processing = scale_processing_for_preview(processing);
-    let bordered = match add_border_with_cancel(&image, &processing, || preview_cancelled(&cancel))
-    {
-        Ok(image) => image,
-        Err(ProcessingError::Cancelled) => return Ok(PreviewBuildOutcome::Cancelled),
-        Err(error) => {
-            return Err(anyhow::Error::new(error)
-                .context("failed to add border")
-                .to_string());
-        }
+    let preview_crop = crop_rect(image.width(), image.height(), processing.print_size)
+        .context("failed to calculate preview crop")
+        .map_err(|error| error.to_string())?;
+    let crop_display = apply_source_profile_to_srgb(&image, source_icc_profile.as_deref())
+        .context("failed to color-manage crop preview")
+        .map_err(|error| error.to_string())?;
+    let crop_proofed = if softproof.profile_path().is_some() {
+        Some(
+            apply_preview_profile_with_source(&image, &softproof, source_icc_profile.as_deref())
+                .context("failed to apply crop softproof preview")
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
     };
+    if preview_cancelled(&cancel) {
+        return Ok(PreviewBuildOutcome::Cancelled);
+    }
+    let bordered =
+        match add_preview_border_with_cancel(&image, &processing, || preview_cancelled(&cancel)) {
+            Ok(image) => image,
+            Err(ProcessingError::Cancelled) => return Ok(PreviewBuildOutcome::Cancelled),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context("failed to add border")
+                    .to_string());
+            }
+        };
     if preview_cancelled(&cancel) {
         return Ok(PreviewBuildOutcome::Cancelled);
     }
@@ -3458,6 +4069,9 @@ fn build_preview(
     Ok(PreviewBuildOutcome::Ready(PreviewImages {
         base: PreviewBitmap::from_dynamic(&display),
         softproof: proofed.as_ref().map(PreviewBitmap::from_dynamic),
+        crop_base: PreviewBitmap::from_dynamic(&crop_display),
+        crop_softproof: crop_proofed.as_ref().map(PreviewBitmap::from_dynamic),
+        crop_rect: preview_crop,
     }))
 }
 
@@ -3465,21 +4079,16 @@ fn preview_cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Acquire)
 }
 
-fn preview_refresh_is_current(
-    expected_request_id: u64,
-    current_request_id: u64,
-    preview_open: bool,
-) -> bool {
-    expected_request_id == current_request_id && preview_open
+fn preview_refresh_is_current(expected_request_id: u64, current_request_id: u64) -> bool {
+    expected_request_id == current_request_id
 }
 
 fn preview_replacement_can_start(
     refresh_ready: bool,
     worker_active: bool,
-    preview_open: bool,
     has_selected_file: bool,
 ) -> bool {
-    refresh_ready && !worker_active && preview_open && has_selected_file
+    refresh_ready && !worker_active && has_selected_file
 }
 
 fn export_worker_count(job_count: usize) -> usize {
@@ -3996,38 +4605,11 @@ fn planned_jobs(
 }
 
 fn downscale_for_preview(image: DynamicImage) -> DynamicImage {
-    let (width, height) = image.dimensions();
-    let longest = width.max(height);
+    let longest = image.width().max(image.height());
     if longest <= MAX_PREVIEW_DIM {
         return image;
     }
-    let scale = MAX_PREVIEW_DIM as f32 / longest as f32;
-    image.resize(
-        ((width as f32) * scale).max(1.0) as u32,
-        ((height as f32) * scale).max(1.0) as u32,
-        image::imageops::FilterType::Lanczos3,
-    )
-}
-
-fn scale_processing_for_preview(mut processing: ProcessingOptions) -> ProcessingOptions {
-    if processing.resize_mode == ResizeMode::NoResize {
-        return processing;
-    }
-    let preview_size = PrintSizeMm::new(
-        processing.print_size.width + processing.border_mm * 2.0,
-        processing.print_size.height + processing.border_mm * 2.0,
-    );
-    let Ok((width, height)) = target_pixel_dimensions(preview_size, processing.target_ppi) else {
-        return processing;
-    };
-    let longest = width.max(height);
-    if longest > MAX_PREVIEW_DIM {
-        processing.target_ppi = ((processing.target_ppi as f64 * MAX_PREVIEW_DIM as f64
-            / longest as f64)
-            .floor() as u32)
-            .max(1);
-    }
-    processing
+    image.thumbnail(MAX_PREVIEW_DIM, MAX_PREVIEW_DIM)
 }
 
 #[cfg(test)]
@@ -4083,12 +4665,38 @@ mod tests {
     }
 
     #[test]
-    fn debounced_preview_refresh_requires_current_open_idle_request() {
-        assert!(preview_refresh_is_current(4, 4, true));
-        assert!(!preview_refresh_is_current(4, 5, true));
-        assert!(!preview_refresh_is_current(4, 4, false));
-        assert!(preview_replacement_can_start(true, false, true, true));
-        assert!(!preview_replacement_can_start(true, true, true, true));
+    fn debounced_preview_refresh_requires_current_idle_request() {
+        assert!(preview_refresh_is_current(4, 4));
+        assert!(!preview_refresh_is_current(4, 5));
+        assert!(preview_replacement_can_start(true, false, true));
+        assert!(!preview_replacement_can_start(true, true, true));
+        assert!(!preview_replacement_can_start(true, false, false));
+    }
+
+    #[test]
+    fn print_readiness_flags_low_resolution_and_accepts_print_quality() {
+        crate::i18n::init();
+        let entry_with_dimensions = |dimensions| FileEntry {
+            path: PathBuf::from("photo.tif"),
+            status: Some(FileStatus {
+                dimensions: Some(dimensions),
+                bit_depth: Some(SourceBitDepth::Sixteen),
+                format: Some(ImageFormat::Tiff),
+                color_space: Some("sRGB".to_owned()),
+                thumbnail: None,
+                error: None,
+            }),
+        };
+
+        let low =
+            entry_with_dimensions((1200, 800)).print_readiness(PrintSizeMm::new(600.0, 400.0));
+        assert!(low.warning);
+        assert!(!low.ready);
+
+        let excellent =
+            entry_with_dimensions((7200, 4800)).print_readiness(PrintSizeMm::new(600.0, 400.0));
+        assert!(!excellent.warning);
+        assert!(excellent.ready);
     }
 
     #[test]
@@ -4544,20 +5152,6 @@ mod tests {
     }
 
     #[test]
-    fn resized_preview_scales_target_pixels_to_preview_budget() {
-        let processing =
-            ProcessingOptions::new(PrintSizeMm::new(600.0, 400.0), 8.0, BorderStyle::White)
-                .with_resizing(ResizeMode::Fit, 300);
-
-        let preview = scale_processing_for_preview(processing);
-        let dimensions = target_pixel_dimensions(preview.print_size, preview.target_ppi).unwrap();
-
-        assert!(dimensions.0.max(dimensions.1) <= MAX_PREVIEW_DIM);
-        assert_eq!(preview.resize_mode, ResizeMode::Fit);
-        assert!(preview.target_ppi < processing.target_ppi);
-    }
-
-    #[test]
     fn print_presets_match_both_orientations() {
         assert_eq!(PrintPreset::matching(29.7, 21.0), PrintPreset::A4);
         assert_eq!(PrintPreset::matching(21.0, 29.7), PrintPreset::A4);
@@ -4572,8 +5166,6 @@ mod tests {
             print_height_cm: 29.7,
             border_mm: 4.0,
             length_unit: LengthUnit::Inches,
-            resize_mode: "fit".into(),
-            target_ppi: 240,
             border_style: "black".into(),
             output_format: "tiff".into(),
             quality: 84,
@@ -4614,6 +5206,64 @@ mod tests {
     }
 
     #[test]
+    fn preview_zoom_input_and_wheel_direction_are_bounded() {
+        assert!(preview_zoom_input_is_valid(""));
+        assert!(preview_zoom_input_is_valid("9"));
+        assert!(preview_zoom_input_is_valid("10"));
+        assert!(preview_zoom_input_is_valid("800"));
+        assert!(!preview_zoom_input_is_valid("801"));
+        assert_eq!(
+            scroll_zoom_direction(ScrollDelta::Lines(gpui::point(0.0, 1.0))),
+            1
+        );
+        assert_eq!(
+            scroll_zoom_direction(ScrollDelta::Lines(gpui::point(0.0, -1.0))),
+            -1
+        );
+        assert_eq!(preview_zoom_key_bindings().len(), 3);
+    }
+
+    #[test]
+    fn file_inspection_builds_bounded_thumbnail_and_complete_metadata() {
+        crate::i18n::init();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        DynamicImage::new_rgb8(300, 200).save(&path).unwrap();
+
+        let status = inspect_file(&path);
+        let entry = FileEntry {
+            path,
+            status: Some(status.clone()),
+        };
+        let thumbnail = status.thumbnail.unwrap();
+        let decoded = image::load_from_memory(&thumbnail.bytes).unwrap();
+        let (primary, secondary) = entry.metadata_lines();
+
+        assert!(decoded.width() <= THUMBNAIL_MAX_DIMENSION);
+        assert!(decoded.height() <= THUMBNAIL_MAX_DIMENSION);
+        assert_eq!(status.format, Some(ImageFormat::Png));
+        assert_eq!(status.dimensions, Some((300, 200)));
+        assert!(primary.contains("PNG · 3:2 · 300 × 200 px · 0.1 MP"));
+        assert!(secondary.contains("sRGB (assumed) · 8-bit"));
+    }
+
+    #[test]
+    fn aspect_ratio_uses_nearest_standard_label() {
+        assert_eq!(aspect_ratio_label(6000, 4000), "3:2");
+        assert_eq!(aspect_ratio_label(4000, 6000), "2:3");
+        assert_eq!(aspect_ratio_label(6048, 4024), "3:2");
+        assert_eq!(aspect_ratio_label(4032, 3024), "4:3");
+        assert_eq!(aspect_ratio_label(3024, 4032), "3:4");
+    }
+
+    #[test]
+    fn thumbnail_fit_preserves_aspect_ratio_inside_square() {
+        assert_eq!(fitted_thumbnail_size((400, 200), 88.0), (88.0, 44.0));
+        assert_eq!(fitted_thumbnail_size((200, 400), 88.0), (44.0, 88.0));
+        assert_eq!(fitted_thumbnail_size((300, 300), 88.0), (88.0, 88.0));
+    }
+
+    #[test]
     fn sixteen_bit_default_falls_back_for_eight_bit_source() {
         let mut app = PreprintApp::default();
         app.files.push(FileEntry {
@@ -4621,6 +5271,9 @@ mod tests {
             status: Some(FileStatus {
                 dimensions: Some((100, 100)),
                 bit_depth: Some(SourceBitDepth::Eight),
+                format: Some(ImageFormat::Tiff),
+                color_space: Some("sRGB".into()),
+                thumbnail: None,
                 error: None,
             }),
         });
@@ -4642,6 +5295,9 @@ mod tests {
                 status: Some(FileStatus {
                     dimensions: Some((100, 100)),
                     bit_depth: Some(bit_depth),
+                    format: Some(ImageFormat::Tiff),
+                    color_space: Some("sRGB".into()),
+                    thumbnail: None,
                     error: None,
                 }),
             });

@@ -335,9 +335,8 @@ pub(crate) fn load_image_with_reservations<I, T>(
         })?;
     let icc_profile = usable_rgb_icc_profile(path, decoder.color_type(), icc_profile)?;
     let mut decode_limits = Limits::no_limits();
-    decode_limits.max_alloc = decoded_bytes
-        .max(original_bytes)
-        .checked_add(MAX_DECODER_OVERHEAD_BYTES);
+    decode_limits.max_alloc =
+        decoder_bytes.and_then(|bytes| bytes.checked_add(MAX_DECODER_OVERHEAD_BYTES));
     decoder
         .set_limits(decode_limits)
         .map_err(|source| LoadImageError::Decode {

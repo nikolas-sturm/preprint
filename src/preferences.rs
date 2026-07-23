@@ -69,8 +69,6 @@ pub struct WorkflowPreferences {
     pub print_height_cm: f32,
     pub border_mm: f32,
     pub length_unit: LengthUnit,
-    pub resize_mode: String,
-    pub target_ppi: u32,
     pub border_style: String,
     pub output_format: String,
     pub quality: u8,
@@ -90,8 +88,6 @@ impl Default for WorkflowPreferences {
             print_height_cm: 40.0,
             border_mm: 8.0,
             length_unit: LengthUnit::Centimeters,
-            resize_mode: "none".to_owned(),
-            target_ppi: 300,
             border_style: "mirrored-blur".to_owned(),
             output_format: "tiff".to_owned(),
             quality: 90,
@@ -237,14 +233,6 @@ fn load_from(path: &Path) -> io::Result<Preferences> {
                     preferences.workflow.length_unit = value;
                 }
             }
-            "resize_mode" if matches!(value.trim(), "none" | "fit" | "fill") => {
-                preferences.workflow.resize_mode = value.trim().to_owned();
-            }
-            "target_ppi" => {
-                if let Some(value) = parse_u32(value, 1, 9600) {
-                    preferences.workflow.target_ppi = value;
-                }
-            }
             "border_style" if matches!(value.trim(), "white" | "black" | "mirrored-blur") => {
                 preferences.workflow.border_style = value.trim().to_owned();
             }
@@ -307,14 +295,6 @@ fn parse_u8(value: &str, min: u8, max: u8) -> Option<u8> {
     value
         .trim()
         .parse::<u8>()
-        .ok()
-        .filter(|value| (min..=max).contains(value))
-}
-
-fn parse_u32(value: &str, min: u32, max: u32) -> Option<u32> {
-    value
-        .trim()
-        .parse::<u32>()
         .ok()
         .filter(|value| (min..=max).contains(value))
 }
@@ -414,8 +394,6 @@ fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
             "print_height_cm={}\n",
             "border_mm={}\n",
             "length_unit={}\n",
-            "resize_mode={}\n",
-            "target_ppi={}\n",
             "border_style={}\n",
             "output_format={}\n",
             "quality={}\n",
@@ -433,8 +411,6 @@ fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
         workflow.print_height_cm,
         workflow.border_mm,
         workflow.length_unit.as_str(),
-        workflow.resize_mode,
-        workflow.target_ppi,
         workflow.border_style,
         workflow.output_format,
         workflow.quality,
@@ -518,8 +494,6 @@ mod tests {
                 print_height_cm: 21.0,
                 border_mm: 5.0,
                 length_unit: LengthUnit::Millimeters,
-                resize_mode: "fill".to_owned(),
-                target_ppi: 360,
                 border_style: "white".to_owned(),
                 output_format: "png".to_owned(),
                 quality: 82,
@@ -571,8 +545,6 @@ mod tests {
                 "print_height_cm=nan\n",
                 "border_mm=999\n",
                 "length_unit=points\n",
-                "resize_mode=stretch\n",
-                "target_ppi=0\n",
                 "quality=0\n",
                 "bit_depth=12\n",
                 "png_compression=20\n"
