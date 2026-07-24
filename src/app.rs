@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     process::Command,
@@ -14,13 +14,14 @@ use std::{
 use anyhow::{Context as _, Result};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, ExternalPaths, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled, Subscription, Window,
-    div, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, ExternalPaths, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, IndexPath, Selectable, StyledExt, Theme, ThemeMode,
+    ActiveTheme, Disableable, Icon, IconName, IndexPath, PixelsExt, Selectable, StyledExt, Theme,
+    ThemeMode,
     button::{Button, ButtonVariants as _},
     input::{
         Escape as InputEscape, InputEvent, InputState, NumberInput, NumberInputEvent, SelectAll,
@@ -67,6 +68,13 @@ const THUMBNAIL_DISPLAY_SIZE: f32 = 68.0;
 const MIN_PREVIEW_ZOOM_PERCENT: u16 = 10;
 const MAX_PREVIEW_ZOOM_PERCENT: u16 = 800;
 const PREVIEW_ZOOM_STEP_PERCENT: i32 = 10;
+const LEFT_SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: f32 = 400.0;
+const LEFT_SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 240.0..=600.0;
+const RIGHT_SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 280.0..=600.0;
+const STATUS_BAR_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 72.0..=420.0;
+const PANEL_GAP: f32 = 12.0;
+const STATUS_BAR_DEFAULT_HEIGHT: f32 = 96.0;
 
 gpui::actions!(preprint, [ZoomIn, ZoomOut]);
 
@@ -85,6 +93,9 @@ fn tr(key: &str) -> String {
 pub struct PreprintApp {
     files: Vec<FileEntry>,
     selected_index: usize,
+    selected_indices: HashSet<usize>,
+    selection_anchor: usize,
+    batch_defaults: JobSettings,
     print_width_cm: f32,
     print_height_cm: f32,
     length_unit: LengthUnit,
@@ -119,8 +130,14 @@ pub struct PreprintApp {
     preferences_save_generation: u64,
     update: AppUpdateState,
     advanced_open: bool,
+    selection_filters_open: bool,
     editing_input_original: Option<String>,
     ui: Option<AppUiState>,
+    left_sidebar_width: f32,
+    right_sidebar_width: f32,
+    status_bar_height: f32,
+    panel_resize: Option<PanelResize>,
+
     logo: Arc<gpui::Image>,
 }
 
@@ -129,6 +146,24 @@ impl Default for PreprintApp {
         Self {
             files: Vec::new(),
             selected_index: 0,
+            selected_indices: HashSet::new(),
+            selection_anchor: 0,
+            batch_defaults: JobSettings {
+                processing: ProcessingOptions::new(
+                    PrintSizeMm::new(600.0, 400.0),
+                    8.0,
+                    BorderStyle::MirroredBlur,
+                ),
+                export: ExportOptions {
+                    format: OutputFormat::Tiff,
+                    quality: 90,
+                    bit_depth: BitDepth::Sixteen,
+                    png_compression: 6,
+                    tiff_compression: TiffCompression::Deflate,
+                    tiff_deflate_level: TiffDeflateLevel::Best,
+                    pixel_density: None,
+                },
+            },
             print_width_cm: 60.0,
             print_height_cm: 40.0,
             length_unit: LengthUnit::Centimeters,
@@ -163,8 +198,14 @@ impl Default for PreprintApp {
             preferences_save_generation: 0,
             update: AppUpdateState::Idle,
             advanced_open: false,
+            selection_filters_open: false,
             editing_input_original: None,
             ui: None,
+            left_sidebar_width: LEFT_SIDEBAR_DEFAULT_WIDTH,
+            right_sidebar_width: RIGHT_SIDEBAR_DEFAULT_WIDTH,
+            status_bar_height: STATUS_BAR_DEFAULT_HEIGHT,
+            panel_resize: None,
+
             logo: Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
                 include_bytes!("../assets/logo_220x220.png").to_vec(),
@@ -191,6 +232,20 @@ struct AppUiState {
     png_compression_input: Entity<InputState>,
     preview_zoom: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy)]
+enum PanelResizeTarget {
+    LeftSidebar,
+    RightSidebar,
+    StatusBar,
+}
+
+#[derive(Clone, Copy)]
+struct PanelResize {
+    target: PanelResizeTarget,
+    pointer_start: f32,
+    size_start: f32,
 }
 
 #[derive(Clone)]
@@ -370,7 +425,11 @@ impl SelectItem for BitDepth {
     type Value = Self;
 
     fn title(&self) -> SharedString {
-        self.label().into()
+        match self {
+            Self::Eight => self.label(),
+            Self::Sixteen => tr("bit-depth-best"),
+        }
+        .into()
     }
 
     fn value(&self) -> &Self::Value {
@@ -493,6 +552,7 @@ impl PreprintApp {
     ) -> Self {
         let mut this = Self::default();
         this.apply_workflow_preferences(&workflow);
+
         this.preferences_enabled = preferences_error.is_none();
         if let Some(error) = preferences_error {
             this.status_message = Some(StatusMessage::error(
@@ -775,6 +835,7 @@ impl PreprintApp {
                 {
                     this.print_width_cm = width;
                     this.print_height_cm = height;
+                    this.apply_setting_to_selection(SettingField::PrintSize);
                     this.invalidate_preview_and_refresh(window, cx);
                     this.syncing_print_inputs = true;
                     width_for_preset.update(cx, |input, cx| {
@@ -816,6 +877,7 @@ impl PreprintApp {
                         {
                             this.print_width_cm = value;
                             this.mark_custom_preset(window, cx);
+                            this.apply_setting_to_selection(SettingField::PrintSize);
                             this.invalidate_preview_and_refresh(window, cx);
                             cx.notify();
                         }
@@ -863,6 +925,7 @@ impl PreprintApp {
                 if (this.print_width_cm - centimeters).abs() > 0.001 {
                     this.print_width_cm = centimeters;
                     this.mark_custom_preset(window, cx);
+                    this.apply_setting_to_selection(SettingField::PrintSize);
                     this.invalidate_preview_and_refresh(window, cx);
                 }
                 input.update(cx, |input, cx| {
@@ -891,6 +954,7 @@ impl PreprintApp {
                         {
                             this.print_height_cm = value;
                             this.mark_custom_preset(window, cx);
+                            this.apply_setting_to_selection(SettingField::PrintSize);
                             this.invalidate_preview_and_refresh(window, cx);
                             cx.notify();
                         }
@@ -938,6 +1002,7 @@ impl PreprintApp {
                 if (this.print_height_cm - centimeters).abs() > 0.001 {
                     this.print_height_cm = centimeters;
                     this.mark_custom_preset(window, cx);
+                    this.apply_setting_to_selection(SettingField::PrintSize);
                     this.invalidate_preview_and_refresh(window, cx);
                 }
                 input.update(cx, |input, cx| {
@@ -961,6 +1026,7 @@ impl PreprintApp {
                             && this.border_mm != value
                         {
                             this.border_mm = value;
+                            this.apply_setting_to_selection(SettingField::BorderWidth);
                             this.invalidate_preview_and_refresh(window, cx);
                             cx.notify();
                         }
@@ -994,6 +1060,7 @@ impl PreprintApp {
                 .clamp(0.0, 200.0);
                 if this.border_mm != value {
                     this.border_mm = value;
+                    this.apply_setting_to_selection(SettingField::BorderWidth);
                     this.invalidate_preview_and_refresh(window, cx);
                 }
                 input.update(cx, |input, cx| {
@@ -1012,6 +1079,7 @@ impl PreprintApp {
                 };
                 if this.border_style != *value {
                     this.border_style = *value;
+                    this.apply_setting_to_selection(SettingField::BorderStyle);
                     this.invalidate_preview_and_refresh(window, cx);
                     this.persist_workflow_preferences();
                     cx.notify();
@@ -1028,6 +1096,8 @@ impl PreprintApp {
                 if this.output_format != *value {
                     this.output_format = *value;
                     this.normalize_bit_depth_choice();
+                    this.apply_setting_to_selection(SettingField::OutputFormat);
+                    this.apply_setting_to_selection(SettingField::BitDepth);
                     this.sync_bit_depth_select(window, cx);
                     this.invalidate_preview_and_refresh(window, cx);
                     this.persist_workflow_preferences();
@@ -1045,7 +1115,9 @@ impl PreprintApp {
                 if this.bit_depth != *value {
                     this.bit_depth = *value;
                     this.normalize_bit_depth_choice();
+                    this.apply_setting_to_selection(SettingField::BitDepth);
                     this.sync_bit_depth_select(window, cx);
+                    this.invalidate_preview_and_refresh(window, cx);
                     this.persist_workflow_preferences();
                     cx.notify();
                 }
@@ -1060,6 +1132,7 @@ impl PreprintApp {
                 };
                 if this.tiff_compression != *value {
                     this.tiff_compression = *value;
+                    this.apply_setting_to_selection(SettingField::TiffCompression);
                     this.update_preview_compression_label();
                     this.persist_workflow_preferences();
                     cx.notify();
@@ -1075,6 +1148,7 @@ impl PreprintApp {
                 };
                 if this.tiff_deflate_level != *value {
                     this.tiff_deflate_level = *value;
+                    this.apply_setting_to_selection(SettingField::TiffDeflateLevel);
                     this.update_preview_compression_label();
                     this.persist_workflow_preferences();
                     cx.notify();
@@ -1096,6 +1170,7 @@ impl PreprintApp {
                             && this.quality != value
                         {
                             this.quality = value;
+                            this.apply_setting_to_selection(SettingField::Quality);
                             this.invalidate_preview_and_refresh(window, cx);
                             quality_slider.update(cx, |slider, cx| {
                                 slider.set_value(value as f32, window, cx)
@@ -1129,6 +1204,7 @@ impl PreprintApp {
                 .clamp(1, 100);
                 if this.quality != value {
                     this.quality = value;
+                    this.apply_setting_to_selection(SettingField::Quality);
                     this.invalidate_preview_and_refresh(window, cx);
                 }
                 input.update(cx, |input, cx| {
@@ -1148,6 +1224,7 @@ impl PreprintApp {
                 let value = value.start().round().clamp(1.0, 100.0) as u8;
                 if this.quality != value {
                     this.quality = value;
+                    this.apply_setting_to_selection(SettingField::Quality);
                     this.invalidate_preview_and_refresh(window, cx);
                     this.schedule_workflow_preferences_save(cx);
                 }
@@ -1173,6 +1250,7 @@ impl PreprintApp {
                             && this.png_compression != value
                         {
                             this.png_compression = value;
+                            this.apply_setting_to_selection(SettingField::PngCompression);
                             this.update_preview_compression_label();
                             png_slider.update(cx, |slider, cx| {
                                 slider.set_value(value as f32, window, cx)
@@ -1206,6 +1284,7 @@ impl PreprintApp {
                 .clamp(1, 9);
                 if this.png_compression != value {
                     this.png_compression = value;
+                    this.apply_setting_to_selection(SettingField::PngCompression);
                     this.update_preview_compression_label();
                 }
                 input.update(cx, |input, cx| {
@@ -1225,6 +1304,7 @@ impl PreprintApp {
                 let value = value.start().round().clamp(1.0, 9.0) as u8;
                 if this.png_compression != value {
                     this.png_compression = value;
+                    this.apply_setting_to_selection(SettingField::PngCompression);
                     this.update_preview_compression_label();
                     this.schedule_workflow_preferences_save(cx);
                 }
@@ -1339,38 +1419,40 @@ impl PreprintApp {
         self.convert_output_profile =
             workflow.convert_output_profile && workflow.softproof_profile.is_some();
         self.output_dir = workflow.output_dir.clone();
+        self.batch_defaults = self.current_job_settings();
     }
 
     fn workflow_preferences(&self) -> WorkflowPreferences {
+        let defaults = self.batch_defaults;
         WorkflowPreferences {
-            print_width_cm: self.print_width_cm,
-            print_height_cm: self.print_height_cm,
-            border_mm: self.border_mm,
+            print_width_cm: defaults.processing.print_size.width / 10.0,
+            print_height_cm: defaults.processing.print_size.height / 10.0,
+            border_mm: defaults.processing.border_mm,
             length_unit: self.length_unit,
-            border_style: match self.border_style {
+            border_style: match defaults.processing.border_style {
                 BorderStyle::White => "white",
                 BorderStyle::Black => "black",
                 BorderStyle::MirroredBlur => "mirrored-blur",
             }
             .to_owned(),
-            output_format: match self.output_format {
+            output_format: match defaults.export.format {
                 OutputFormat::Png => "png",
                 OutputFormat::Jpeg => "jpeg",
                 OutputFormat::Tiff => "tiff",
             }
             .to_owned(),
-            quality: self.quality,
-            bit_depth: match self.bit_depth {
+            quality: defaults.export.quality,
+            bit_depth: match defaults.export.bit_depth {
                 BitDepth::Eight => 8,
                 BitDepth::Sixteen => 16,
             },
-            png_compression: self.png_compression,
-            tiff_compression: match self.tiff_compression {
+            png_compression: defaults.export.png_compression,
+            tiff_compression: match defaults.export.tiff_compression {
                 TiffCompression::Lzw => "lzw",
                 TiffCompression::Deflate => "deflate",
             }
             .to_owned(),
-            tiff_deflate_level: match self.tiff_deflate_level {
+            tiff_deflate_level: match defaults.export.tiff_deflate_level {
                 TiffDeflateLevel::Fast => "fast",
                 TiffDeflateLevel::Balanced => "balanced",
                 TiffDeflateLevel::Best => "best",
@@ -1427,6 +1509,7 @@ impl PreprintApp {
 
     fn swap_print_orientation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         std::mem::swap(&mut self.print_width_cm, &mut self.print_height_cm);
+        self.apply_setting_to_selection(SettingField::PrintSize);
         self.syncing_print_inputs = true;
         if let Some(ui) = &self.ui {
             ui.print_width.update(cx, |input, cx| {
@@ -1622,6 +1705,210 @@ impl PreprintApp {
         }
     }
 
+    fn current_job_settings(&self) -> JobSettings {
+        JobSettings {
+            processing: self.processing_options(),
+            export: self.export_options(),
+        }
+    }
+
+    fn job_settings_for_entry(&self, entry: &FileEntry) -> JobSettings {
+        entry.overrides.apply(self.batch_defaults)
+    }
+
+    fn selected_job_settings(&self) -> JobSettings {
+        self.selected_entry().map_or(self.batch_defaults, |entry| {
+            self.job_settings_for_entry(entry)
+        })
+    }
+
+    fn apply_setting_to_selection(&mut self, field: SettingField) {
+        let settings = self.current_job_settings();
+        if self.files.is_empty() {
+            let mut update = JobOverrides::default();
+            update.set(field, settings);
+            self.batch_defaults = update.apply(self.batch_defaults);
+            return;
+        }
+        if self.selected_indices.is_empty() {
+            return;
+        }
+        if self.selected_indices.len() == self.files.len() {
+            let mut update = JobOverrides::default();
+            update.set(field, settings);
+            self.batch_defaults = update.apply(self.batch_defaults);
+            for entry in &mut self.files {
+                entry.overrides.clear(field);
+            }
+            return;
+        }
+        for index in self.selected_indices.iter().copied() {
+            if let Some(entry) = self.files.get_mut(index) {
+                entry.overrides.set(field, settings);
+            }
+        }
+    }
+
+    fn select_file(
+        &mut self,
+        index: usize,
+        extend: bool,
+        toggle: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if extend {
+            let start = self.selection_anchor.min(index);
+            let end = self.selection_anchor.max(index);
+            if !toggle {
+                self.selected_indices.clear();
+            }
+            self.selected_indices.extend(start..=end);
+        } else if toggle {
+            if !self.selected_indices.remove(&index) {
+                self.selected_indices.insert(index);
+            }
+            if self.selected_indices.is_empty() {
+                self.selected_indices.insert(index);
+            }
+            self.selection_anchor = index;
+        } else {
+            self.selected_indices.clear();
+            self.selected_indices.insert(index);
+            self.selection_anchor = index;
+        }
+        self.selected_index = if self.selected_indices.contains(&index) {
+            index
+        } else {
+            self.selected_indices.iter().copied().min().unwrap_or(index)
+        };
+        self.sync_editor_to_selected(window, cx);
+        self.invalidate_preview_and_refresh(window, cx);
+        cx.notify();
+    }
+
+    fn select_matching(
+        &mut self,
+        filter: SelectionFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_indices = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| filter.matches(entry).then_some(index))
+            .collect();
+        if let Some(index) = self.selected_indices.iter().copied().min() {
+            self.selected_index = index;
+            self.selection_anchor = index;
+            self.sync_editor_to_selected(window, cx);
+            self.invalidate_preview_and_refresh(window, cx);
+        }
+        self.selection_filters_open = false;
+        cx.notify();
+    }
+
+    fn selection_has_mixed_settings(&self) -> bool {
+        let mut settings = self
+            .selected_indices
+            .iter()
+            .filter_map(|index| self.files.get(*index))
+            .map(|entry| self.job_settings_for_entry(entry));
+        let Some(first) = settings.next() else {
+            return false;
+        };
+        settings.any(|settings| settings != first)
+    }
+
+    fn sync_editor_to_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.selected_job_settings();
+        self.print_width_cm = settings.processing.print_size.width / 10.0;
+        self.print_height_cm = settings.processing.print_size.height / 10.0;
+        self.print_preset = PrintPreset::matching(self.print_width_cm, self.print_height_cm);
+        self.border_mm = settings.processing.border_mm;
+        self.border_style = settings.processing.border_style;
+        self.output_format = settings.export.format;
+        self.quality = settings.export.quality;
+        self.bit_depth = settings.export.bit_depth;
+        self.png_compression = settings.export.png_compression;
+        self.tiff_compression = settings.export.tiff_compression;
+        self.tiff_deflate_level = settings.export.tiff_deflate_level;
+
+        let Some(ui) = &self.ui else {
+            return;
+        };
+        self.syncing_print_inputs = true;
+        ui.print_width.update(cx, |input, cx| {
+            input.set_value(
+                format_length(self.length_unit.display_value(self.print_width_cm)),
+                window,
+                cx,
+            )
+        });
+        ui.print_height.update(cx, |input, cx| {
+            input.set_value(
+                format_length(self.length_unit.display_value(self.print_height_cm)),
+                window,
+                cx,
+            )
+        });
+        ui.print_preset.update(cx, |state, cx| {
+            state.set_selected_value(&self.print_preset, window, cx)
+        });
+        ui.border_width.update(cx, |input, cx| {
+            input.set_value(format_length(self.border_mm), window, cx)
+        });
+        ui.border_style.update(cx, |state, cx| {
+            state.set_selected_value(&self.border_style, window, cx)
+        });
+        ui.output_format.update(cx, |state, cx| {
+            state.set_selected_value(&self.output_format, window, cx)
+        });
+        ui.bit_depth.update(cx, |state, cx| {
+            state.set_items(
+                if self.output_format == OutputFormat::Tiff {
+                    vec![BitDepth::Eight, BitDepth::Sixteen]
+                } else {
+                    vec![BitDepth::Eight]
+                },
+                window,
+                cx,
+            );
+            state.set_selected_value(&self.bit_depth, window, cx)
+        });
+        ui.quality.update(cx, |slider, cx| {
+            slider.set_value(self.quality as f32, window, cx)
+        });
+        ui.quality_input.update(cx, |input, cx| {
+            input.set_value(self.quality.to_string(), window, cx)
+        });
+        ui.png_compression.update(cx, |slider, cx| {
+            slider.set_value(self.png_compression as f32, window, cx)
+        });
+        ui.png_compression_input.update(cx, |input, cx| {
+            input.set_value(self.png_compression.to_string(), window, cx)
+        });
+        ui.tiff_compression.update(cx, |state, cx| {
+            state.set_selected_value(&self.tiff_compression, window, cx)
+        });
+        ui.tiff_deflate_level.update(cx, |state, cx| {
+            state.set_selected_value(&self.tiff_deflate_level, window, cx)
+        });
+        self.syncing_print_inputs = false;
+    }
+
+    fn reset_selected_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for index in self.selected_indices.iter().copied() {
+            if let Some(entry) = self.files.get_mut(index) {
+                entry.overrides = JobOverrides::default();
+            }
+        }
+        self.sync_editor_to_selected(window, cx);
+        self.invalidate_preview_and_refresh(window, cx);
+        cx.notify();
+    }
+
     fn selected_entry(&self) -> Option<&FileEntry> {
         self.files.get(self.selected_index)
     }
@@ -1631,12 +1918,11 @@ impl PreprintApp {
     }
 
     fn batch_supports_sixteen_bit(&self) -> bool {
-        !self.files.is_empty()
-            && self.files.iter().all(|entry| {
-                entry.status.as_ref().is_some_and(|status| {
-                    status.error.is_none() && status.bit_depth == Some(SourceBitDepth::Sixteen)
-                })
+        self.files.iter().any(|entry| {
+            entry.status.as_ref().is_some_and(|status| {
+                status.error.is_none() && status.bit_depth == Some(SourceBitDepth::Sixteen)
             })
+        })
     }
 
     fn clear_preview_result(&mut self) {
@@ -1651,8 +1937,14 @@ impl PreprintApp {
 
     fn update_preview_compression_label(&mut self) {
         if self.preview_base.is_some() {
+            let settings = self.selected_job_settings();
+            let source_depth = self
+                .selected_entry()
+                .and_then(|entry| entry.status.as_ref())
+                .and_then(|status| status.bit_depth);
+            let export = resolved_export_options(source_depth, settings.export);
             self.preview
-                .set_compression_label(compression_preview_label(&self.export_options()));
+                .set_compression_label(compression_preview_label(&export));
         }
     }
 
@@ -1699,9 +1991,7 @@ impl PreprintApp {
     }
 
     fn normalize_bit_depth_choice(&mut self) {
-        let allowed = self.output_format == OutputFormat::Tiff
-            && (self.files.is_empty() || self.batch_supports_sixteen_bit());
-        if self.bit_depth == BitDepth::Sixteen && !allowed {
+        if self.bit_depth == BitDepth::Sixteen && self.output_format != OutputFormat::Tiff {
             self.bit_depth = BitDepth::Eight;
         }
     }
@@ -1710,11 +2000,9 @@ impl PreprintApp {
         let Some(ui) = &self.ui else {
             return;
         };
-        let can_16 = self.output_format == OutputFormat::Tiff
-            && (self.files.is_empty() || self.batch_supports_sixteen_bit());
         ui.bit_depth.update(cx, |state, cx| {
             state.set_items(
-                if can_16 {
+                if self.output_format == OutputFormat::Tiff {
                     vec![BitDepth::Eight, BitDepth::Sixteen]
                 } else {
                     vec![BitDepth::Eight]
@@ -1765,10 +2053,16 @@ impl PreprintApp {
     ) {
         self.importing = false;
         let was_empty = self.files.is_empty();
+        let all_were_selected = !was_empty && self.selected_indices.len() == self.files.len();
+        let previous_len = self.files.len();
         let added_count = prepared.entries.len();
         self.files.extend(prepared.entries);
         if was_empty && !self.files.is_empty() {
             self.selected_index = 0;
+            self.selection_anchor = 0;
+            self.selected_indices.extend(0..self.files.len());
+        } else if all_were_selected {
+            self.selected_indices.extend(previous_len..self.files.len());
         }
         self.status_message = Some(StatusMessage::ok(import_summary(
             added_count,
@@ -1776,9 +2070,7 @@ impl PreprintApp {
             prepared.skipped,
             prepared.limited,
         )));
-        let previous_depth = self.bit_depth;
-        self.normalize_bit_depth_choice();
-        if was_empty || self.bit_depth != previous_depth {
+        if was_empty {
             self.invalidate_preview_and_refresh(window, cx);
         }
         self.sync_bit_depth_select(window, cx);
@@ -1805,25 +2097,27 @@ impl PreprintApp {
     }
 
     fn remove_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.queue_locked() || self.files.is_empty() {
+        if self.queue_locked() || self.files.is_empty() || self.selected_indices.is_empty() {
             return;
         }
-        let removed = self.files.remove(self.selected_index);
+        let removed_count = self.selected_indices.len();
+        let mut index = 0;
+        self.files.retain(|_| {
+            let keep = !self.selected_indices.contains(&index);
+            index += 1;
+            keep
+        });
+        self.selected_indices.clear();
         self.selected_index = self.selected_index.min(self.files.len().saturating_sub(1));
+        self.selection_anchor = self.selected_index;
+        if !self.files.is_empty() {
+            self.selected_indices.insert(self.selected_index);
+        }
         self.invalidate_preview_and_refresh(window, cx);
-        let fallback_name = tr("image-fallback-name");
-        self.status_message = Some(StatusMessage::ok(
-            rust_i18n::t!(
-                "removed-image",
-                name = removed
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(&fallback_name)
-            )
-            .into_owned(),
-        ));
-        self.normalize_bit_depth_choice();
+        self.status_message = Some(StatusMessage::ok(i18n::plural(
+            "removed-images",
+            removed_count,
+        )));
         self.sync_bit_depth_select(window, cx);
         cx.notify();
     }
@@ -1834,10 +2128,11 @@ impl PreprintApp {
         }
         let count = self.files.len();
         self.files.clear();
+        self.selected_indices.clear();
         self.selected_index = 0;
+        self.selection_anchor = 0;
         self.invalidate_preview();
         self.status_message = Some(StatusMessage::ok(i18n::plural("cleared-images", count)));
-        self.normalize_bit_depth_choice();
         self.sync_bit_depth_select(window, cx);
         cx.notify();
     }
@@ -1893,8 +2188,13 @@ impl PreprintApp {
         let request_id = self.preview_request_id;
         self.preview_worker_active = true;
         self.preview_refresh_ready = false;
-        let processing = self.processing_options();
-        let export = self.export_options();
+        let settings = self.selected_job_settings();
+        let source_depth = self
+            .selected_entry()
+            .and_then(|entry| entry.status.as_ref())
+            .and_then(|status| status.bit_depth);
+        let processing = settings.processing;
+        let export = resolved_export_options(source_depth, settings.export);
         let mut softproof = self.softproof.clone();
         softproof.set_enabled(true);
         self.preview.mark_rendering();
@@ -1931,10 +2231,14 @@ impl PreprintApp {
                         this.preview_crop_softproof = images.crop_softproof;
                         this.preview_crop_rect = Some(images.crop_rect);
                         this.preview_image_size = Some(size);
+                        let settings = this.selected_job_settings();
+                        let source_depth = this
+                            .selected_entry()
+                            .and_then(|entry| entry.status.as_ref())
+                            .and_then(|status| status.bit_depth);
+                        let export = resolved_export_options(source_depth, settings.export);
                         this.preview
-                            .set_compression_label(compression_preview_label(
-                                &this.export_options(),
-                            ));
+                            .set_compression_label(compression_preview_label(&export));
                         this.status_message = Some(StatusMessage::ok(tr("preview-ready")));
                     }
                     Ok(PreviewBuildOutcome::Cancelled) => {
@@ -1976,17 +2280,27 @@ impl PreprintApp {
             cx.notify();
             return;
         };
+        let job_settings: HashMap<_, _> = files
+            .iter()
+            .filter_map(|path| {
+                self.files
+                    .iter()
+                    .find(|entry| entry.path == *path)
+                    .map(|entry| (path.clone(), self.job_settings_for_entry(entry)))
+            })
+            .collect();
         let plan = BatchExportPlan {
             output_dir: output_dir.clone(),
-            processing: self.processing_options(),
-            export: self.export_options(),
+            processing: self.batch_defaults.processing,
+            export: self.batch_defaults.export,
+            job_settings,
             output_profile_path: self
                 .convert_output_profile
                 .then(|| self.softproof.profile_path().map(Path::to_path_buf))
                 .flatten(),
             output_profile: None,
         };
-        let jobs = planned_jobs(&files, &output_dir, plan.export.format);
+        let jobs = planned_jobs_with_settings(&files, &output_dir, &plan);
         self.start_export_jobs(jobs, plan, Vec::new(), cx);
     }
 
@@ -2080,6 +2394,7 @@ impl PreprintApp {
             let runtime = ExportRuntime {
                 processing,
                 export_options: export,
+                job_settings: plan.job_settings.clone(),
                 output_profile,
                 pool,
                 budget,
@@ -2189,6 +2504,60 @@ impl PreprintApp {
             .label(label)
             .icon(icon)
             .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+    }
+
+    fn selection_matches_filter(&self, filter: SelectionFilter) -> bool {
+        let matching = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| filter.matches(entry).then_some(index))
+            .collect::<HashSet<_>>();
+        !matching.is_empty() && matching == self.selected_indices
+    }
+
+    fn selection_chip(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        filter: SelectionFilter,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let active = self.selection_matches_filter(filter);
+        let available = self.files.iter().any(|entry| filter.matches(entry));
+        let label: SharedString = label.into();
+        div()
+            .id(id)
+            .h(px(26.))
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .text_xs()
+            .whitespace_nowrap()
+            .when(active, |chip| {
+                chip.bg(cx.theme().list_active)
+                    .border_color(cx.theme().list_active_border)
+                    .font_medium()
+            })
+            .when(!active, |chip| {
+                chip.bg(cx.theme().background)
+                    .border_color(cx.theme().border)
+            })
+            .when(available, |chip| {
+                chip.cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().list_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_matching(filter, window, cx)
+                    }))
+            })
+            .when(!available, |chip| {
+                chip.text_color(cx.theme().muted_foreground).opacity(0.45)
+            })
+            .child(label)
+            .into_any_element()
     }
 
     fn number_input_with_tooltip(
@@ -2356,9 +2725,22 @@ impl PreprintApp {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .map_or_else(|| tr("image-fallback-name"), str::to_owned);
-                let selected = self.selected_index == index;
+                let selected = self.selected_indices.contains(&index);
+                let settings = self.job_settings_for_entry(entry);
                 let (primary_metadata, secondary_metadata) = entry.metadata_lines();
-                let readiness = entry.print_readiness(self.print_size());
+                let settings_metadata = format!(
+                    "{} · {:.0} × {:.0} cm · {}",
+                    secondary_metadata,
+                    settings.processing.print_size.width / 10.0,
+                    settings.processing.print_size.height / 10.0,
+                    resolved_export_options(
+                        entry.status.as_ref().and_then(|status| status.bit_depth),
+                        settings.export,
+                    )
+                    .bit_depth
+                    .label(),
+                );
+                let readiness = entry.print_readiness(settings.processing.print_size);
                 let thumbnail_size = entry
                     .status
                     .as_ref()
@@ -2426,7 +2808,7 @@ impl PreprintApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(secondary_metadata),
+                                    .child(settings_metadata),
                             )
                             .child(
                                 div()
@@ -2452,12 +2834,9 @@ impl PreprintApp {
                                     .child(readiness.label),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.selected_index = index;
-                        this.invalidate_preview_and_refresh(window, cx);
-                        this.normalize_bit_depth_choice();
-                        this.sync_bit_depth_select(window, cx);
-                        cx.notify();
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let modifiers = event.modifiers();
+                        this.select_file(index, modifiers.shift, modifiers.secondary(), window, cx);
                     }));
                 if selected {
                     row = row
@@ -2472,62 +2851,203 @@ impl PreprintApp {
             }
         }
 
-        let add = self
-            .button(
-                "add-images",
-                tr("add-images"),
-                IconName::Plus,
-                cx,
-                |this, window, cx| this.pick_files(window, cx),
-            )
-            .disabled(queue_locked);
-        let add_folder = self
-            .button(
-                "add-folder",
-                tr("add-folder"),
-                IconName::FolderOpen,
-                cx,
-                |this, window, cx| this.pick_image_folder(window, cx),
-            )
-            .disabled(queue_locked);
-        let remove = self
-            .button(
-                "remove-image",
-                tr("remove-image"),
-                IconName::Close,
-                cx,
-                |this, window, cx| this.remove_selected_file(window, cx),
-            )
-            .disabled(queue_locked || self.files.is_empty());
-        let clear = self
-            .button(
-                "clear-images",
-                tr("clear-all"),
-                IconName::Delete,
-                cx,
-                |this, window, cx| this.clear_files(window, cx),
-            )
-            .ghost()
-            .disabled(queue_locked || self.files.is_empty());
-        let actions = div()
+        let queue_actions = div()
             .flex()
-            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("add-images")
+                    .icon(IconName::Plus)
+                    .tooltip(tr("add-images"))
+                    .primary()
+                    .disabled(queue_locked)
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx))),
+            )
+            .child(
+                Button::new("add-folder")
+                    .icon(IconName::FolderOpen)
+                    .tooltip(tr("add-folder"))
+                    .ghost()
+                    .disabled(queue_locked)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.pick_image_folder(window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("remove-image")
+                    .icon(IconName::Close)
+                    .tooltip(tr("remove-image"))
+                    .ghost()
+                    .disabled(queue_locked || self.selected_indices.is_empty())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.remove_selected_file(window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("clear-images")
+                    .icon(IconName::Delete)
+                    .tooltip(tr("clear-all"))
+                    .danger()
+                    .ghost()
+                    .disabled(queue_locked || self.files.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.clear_files(window, cx))),
+            );
+        let category_label = |label: String| {
+            div()
+                .w(px(68.))
+                .flex_none()
+                .text_xs()
+                .font_medium()
+                .text_color(cx.theme().muted_foreground)
+                .child(label)
+        };
+        let selection_filters = v_flex()
             .gap_2()
-            .child(add)
-            .child(add_folder)
-            .child(remove)
-            .child(clear);
-        self.card(
-            tr("card-photo-queue"),
-            v_flex()
-                .flex_1()
-                .min_h(px(0.))
-                .gap_3()
-                .child(actions)
-                .child(list),
-            cx,
-        )
-        .h_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(category_label(tr("orientation")))
+                    .child(self.selection_chip(
+                        "select-all-images",
+                        tr("select-all"),
+                        SelectionFilter::All,
+                        cx,
+                    ))
+                    .child(self.selection_chip(
+                        "select-landscape",
+                        tr("landscape"),
+                        SelectionFilter::Landscape,
+                        cx,
+                    ))
+                    .child(self.selection_chip(
+                        "select-portrait",
+                        tr("portrait"),
+                        SelectionFilter::Portrait,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(category_label(tr("aspect")))
+                    .child(self.selection_chip(
+                        "select-three-two",
+                        tr("aspect-3-2-short"),
+                        SelectionFilter::ThreeTwo,
+                        cx,
+                    ))
+                    .child(self.selection_chip(
+                        "select-four-three",
+                        tr("aspect-4-3-short"),
+                        SelectionFilter::FourThree,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(category_label(tr("depth")))
+                    .child(self.selection_chip(
+                        "select-eight-bit",
+                        tr("bit-depth-8"),
+                        SelectionFilter::EightBit,
+                        cx,
+                    ))
+                    .child(self.selection_chip(
+                        "select-sixteen-bit",
+                        tr("bit-depth-16"),
+                        SelectionFilter::SixteenBit,
+                        cx,
+                    )),
+            );
+        let selection_control = v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .id("toggle-selection-filters")
+                    .h(px(32.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().list_hover))
+                    .child(div().text_sm().font_medium().child(tr("selection")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                rust_i18n::t!(
+                                    "selection-count",
+                                    selected = self.selected_indices.len(),
+                                    total = self.files.len()
+                                )
+                                .into_owned(),
+                            )
+                            .child(Icon::new(if self.selection_filters_open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selection_filters_open = !this.selection_filters_open;
+                        cx.notify();
+                    })),
+            )
+            .when(self.selection_filters_open, |control| {
+                control.child(selection_filters)
+            });
+        let content = v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .gap_2()
+            .when(!self.files.is_empty(), |content| {
+                content.child(selection_control)
+            })
+            .child(list);
+        v_flex()
+            .h_full()
+            .gap_2()
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(tr("card-photo-queue")),
+                    )
+                    .child(queue_actions),
+            )
+            .child(content)
     }
 
     fn render_print(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2577,11 +3097,30 @@ impl PreprintApp {
                     "",
                     div()
                         .flex()
-                        .items_center()
+                        .flex_wrap()
                         .gap_2()
-                        .child(width)
-                        .child("×")
-                        .child(height),
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(tr("width")),
+                                )
+                                .child(width),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(tr("height")),
+                                )
+                                .child(height),
+                        ),
                 ),
             )
             .child(self.value_row(tr("orientation"), "", swap))
@@ -2743,7 +3282,7 @@ impl PreprintApp {
                 .child(self.value_row(
                     tr("softproof-profile"),
                     profile,
-                    div().flex().gap_1().child(choose).child(clear),
+                    div().flex().flex_wrap().gap_1().child(choose).child(clear),
                 ))
                 .child(self.value_row(tr("output-profile"), "", convert_output)),
             cx,
@@ -2956,8 +3495,20 @@ impl PreprintApp {
     }
 
     fn render_inspector_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_count = self.selected_indices.len();
+        let scope = if !self.files.is_empty() && selected_count == self.files.len() {
+            rust_i18n::t!("all-photos", count = self.files.len()).into_owned()
+        } else {
+            i18n::plural("selected-photos", selected_count)
+        };
+        let detail = if self.selection_has_mixed_settings() {
+            tr("settings-mixed")
+        } else {
+            tr("settings-apply-selection")
+        };
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_2()
@@ -2968,24 +3519,42 @@ impl PreprintApp {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(tr("settings-apply-batch")),
+                            .child(detail),
                     ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().secondary)
-                    .text_sm()
-                    .font_medium()
-                    .child(Icon::new(IconName::GalleryVerticalEnd))
-                    .child(rust_i18n::t!("all-photos", count = self.files.len()).into_owned()),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().secondary)
+                            .text_sm()
+                            .font_medium()
+                            .child(Icon::new(IconName::GalleryVerticalEnd))
+                            .child(scope),
+                    )
+                    .child(
+                        self.button(
+                            "reset-selected-settings",
+                            tr("reset-selected-settings"),
+                            IconName::Redo2,
+                            cx,
+                            |this, window, cx| this.reset_selected_settings(window, cx),
+                        )
+                        .ghost()
+                        .disabled(self.selected_indices.is_empty()),
+                    ),
             )
     }
 
@@ -3194,8 +3763,9 @@ impl PreprintApp {
         let Some((width, height)) = status.dimensions else {
             return tr("ppi-dimensions-unavailable");
         };
-        match crop_rect(width, height, self.print_size()).and_then(|crop| {
-            calculate_ppi(crop.width, crop.height, self.print_size()).map(|ppi| (crop, ppi))
+        let print_size = self.job_settings_for_entry(entry).processing.print_size;
+        match crop_rect(width, height, print_size).and_then(|crop| {
+            calculate_ppi(crop.width, crop.height, print_size).map(|ppi| (crop, ppi))
         }) {
             Ok((crop, ppi)) => {
                 let quality = if ppi.x.min(ppi.y) < 150.0 {
@@ -3227,7 +3797,8 @@ impl PreprintApp {
 
     fn readiness_counts(&self) -> (usize, usize) {
         self.files.iter().fold((0, 0), |(ready, warnings), entry| {
-            let readiness = entry.print_readiness(self.print_size());
+            let print_size = self.job_settings_for_entry(entry).processing.print_size;
+            let readiness = entry.print_readiness(print_size);
             (
                 ready + usize::from(readiness.ready),
                 warnings + usize::from(readiness.warning),
@@ -3238,11 +3809,71 @@ impl PreprintApp {
     fn bit_depth_note(&self) -> String {
         let key = match self.output_format {
             OutputFormat::Tiff if self.files.is_empty() => "note-16-tiff-needs-source",
-            OutputFormat::Tiff if self.batch_supports_sixteen_bit() => "note-16-tiff-available",
+            OutputFormat::Tiff if self.batch_supports_sixteen_bit() => "note-16-tiff-auto",
             OutputFormat::Tiff => "note-16-tiff-8-source",
             _ => "note-16-tiff-only",
         };
         tr(key)
+    }
+
+    fn start_panel_resize(
+        &mut self,
+        target: PanelResizeTarget,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let (pointer_start, size_start) = match target {
+            PanelResizeTarget::LeftSidebar => (event.position.x.as_f32(), self.left_sidebar_width),
+            PanelResizeTarget::RightSidebar => {
+                (event.position.x.as_f32(), self.right_sidebar_width)
+            }
+            PanelResizeTarget::StatusBar => (event.position.y.as_f32(), self.status_bar_height),
+        };
+        self.panel_resize = Some(PanelResize {
+            target,
+            pointer_start,
+            size_start,
+        });
+        cx.stop_propagation();
+    }
+
+    fn resize_active_panel(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resize) = self.panel_resize else {
+            return;
+        };
+        match resize.target {
+            PanelResizeTarget::LeftSidebar => {
+                let delta = event.position.x.as_f32() - resize.pointer_start;
+                self.left_sidebar_width = (resize.size_start + delta).clamp(
+                    *LEFT_SIDEBAR_WIDTH_RANGE.start(),
+                    *LEFT_SIDEBAR_WIDTH_RANGE.end(),
+                );
+            }
+            PanelResizeTarget::RightSidebar => {
+                let delta = event.position.x.as_f32() - resize.pointer_start;
+                self.right_sidebar_width = (resize.size_start - delta).clamp(
+                    *RIGHT_SIDEBAR_WIDTH_RANGE.start(),
+                    *RIGHT_SIDEBAR_WIDTH_RANGE.end(),
+                );
+            }
+            PanelResizeTarget::StatusBar => {
+                let delta = event.position.y.as_f32() - resize.pointer_start;
+                self.status_bar_height = (resize.size_start - delta).clamp(
+                    *STATUS_BAR_HEIGHT_RANGE.start(),
+                    *STATUS_BAR_HEIGHT_RANGE.end(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_panel_resize(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.panel_resize = None;
     }
 }
 
@@ -3322,6 +3953,9 @@ impl Render for PreprintApp {
                     }
                 }),
             )
+            .on_mouse_move(cx.listener(Self::resize_active_panel))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_resize))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_resize))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().background)
@@ -3336,59 +3970,285 @@ impl Render for PreprintApp {
             .child(self.render_header(cx))
             .child(status)
             .child(
-                div()
+                v_flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .flex()
-                    .gap_3()
                     .child(
-                        v_flex()
-                            .w(px(300.))
-                            .flex_none()
-                            .h_full()
-                            .min_h(px(0.))
-                            .child(self.render_files(cx)),
-                    )
-                    .child(
-                        v_flex()
-                            .id("preview-workspace")
+                        div()
                             .flex_1()
-                            .h_full()
                             .min_h(px(0.))
-                            .min_w(px(320.))
-                            .child(self.render_workspace_preview(window, cx)),
+                            .flex()
+                            .child(
+                                v_flex()
+                                    .w(px(self.left_sidebar_width))
+                                    .flex_none()
+                                    .h_full()
+                                    .min_h(px(0.))
+                                    .child(self.render_files(cx)),
+                            )
+                            .child(
+                                div()
+                                    .id("left-sidebar-resize-handle")
+                                    .group("left-sidebar-resize-handle")
+                                    .w(px(PANEL_GAP))
+                                    .h_full()
+                                    .flex_none()
+                                    .flex()
+                                    .justify_center()
+                                    .cursor_col_resize()
+                                    .child(
+                                        div()
+                                            .w(px(1.))
+                                            .h_full()
+                                            .bg(cx.theme().border)
+                                            .group_hover("left-sidebar-resize-handle", |handle| {
+                                                handle.bg(cx.theme().drag_border)
+                                            }),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.start_panel_resize(
+                                                PanelResizeTarget::LeftSidebar,
+                                                event,
+                                                cx,
+                                            )
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("preview-workspace")
+                                    .flex_1()
+                                    .h_full()
+                                    .min_h(px(0.))
+                                    .min_w(px(320.))
+                                    .child(self.render_workspace_preview(window, cx)),
+                            )
+                            .child(
+                                div()
+                                    .id("right-sidebar-resize-handle")
+                                    .group("right-sidebar-resize-handle")
+                                    .w(px(PANEL_GAP))
+                                    .h_full()
+                                    .flex_none()
+                                    .flex()
+                                    .justify_center()
+                                    .cursor_col_resize()
+                                    .child(
+                                        div()
+                                            .w(px(1.))
+                                            .h_full()
+                                            .bg(cx.theme().border)
+                                            .group_hover("right-sidebar-resize-handle", |handle| {
+                                                handle.bg(cx.theme().drag_border)
+                                            }),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.start_panel_resize(
+                                                PanelResizeTarget::RightSidebar,
+                                                event,
+                                                cx,
+                                            )
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .id("settings-column")
+                                    .w(px(self.right_sidebar_width))
+                                    .flex_none()
+                                    .h_full()
+                                    .min_h(px(0.))
+                                    .gap_3()
+                                    .overflow_y_scroll()
+                                    .child(self.render_inspector_header(cx))
+                                    .child(self.render_print(cx))
+                                    .child(self.render_output(cx))
+                                    .child(self.render_preview_card(cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("status-bar-resize-handle")
+                            .group("status-bar-resize-handle")
+                            .w_full()
+                            .h(px(PANEL_GAP))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .cursor_row_resize()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(1.))
+                                    .bg(cx.theme().border)
+                                    .group_hover("status-bar-resize-handle", |handle| {
+                                        handle.bg(cx.theme().drag_border)
+                                    }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.start_panel_resize(PanelResizeTarget::StatusBar, event, cx)
+                                }),
+                            ),
                     )
                     .child(
                         v_flex()
-                            .id("settings-column")
-                            .w(px(380.))
+                            .id("bottom-status-panel")
+                            .w_full()
+                            .h(px(self.status_bar_height))
                             .flex_none()
-                            .h_full()
                             .min_h(px(0.))
                             .gap_3()
                             .overflow_y_scroll()
-                            .child(self.render_inspector_header(cx))
-                            .child(self.render_print(cx))
-                            .child(self.render_output(cx))
-                            .child(self.render_preview_card(cx)),
+                            .when(self.batch.is_some(), |status| {
+                                status.child(self.render_export_status(cx))
+                            })
+                            .child(self.render_export_bar(cx)),
                     ),
             )
-            .when(self.batch.is_some(), |root| {
-                root.child(
-                    div()
-                        .w_full()
-                        .flex_none()
-                        .child(self.render_export_status(cx)),
-                )
-            })
-            .child(self.render_export_bar(cx))
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct JobSettings {
+    processing: ProcessingOptions,
+    export: ExportOptions,
+}
+
+#[derive(Clone, Copy)]
+enum SelectionFilter {
+    All,
+    Landscape,
+    Portrait,
+    ThreeTwo,
+    FourThree,
+    EightBit,
+    SixteenBit,
+}
+
+impl SelectionFilter {
+    fn matches(self, entry: &FileEntry) -> bool {
+        let dimensions = entry.status.as_ref().and_then(|status| status.dimensions);
+        match self {
+            Self::All => true,
+            Self::Landscape => dimensions.is_some_and(|(width, height)| width >= height),
+            Self::Portrait => dimensions.is_some_and(|(width, height)| width < height),
+            Self::ThreeTwo => dimensions.is_some_and(|(width, height)| {
+                let short = width.min(height);
+                short > 0 && ((f64::from(width.max(height)) / f64::from(short)) - 1.5).abs() < 0.03
+            }),
+            Self::FourThree => dimensions.is_some_and(|(width, height)| {
+                let short = width.min(height);
+                short > 0
+                    && ((f64::from(width.max(height)) / f64::from(short)) - (4.0 / 3.0)).abs()
+                        < 0.03
+            }),
+            Self::EightBit => entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.bit_depth == Some(SourceBitDepth::Eight)),
+            Self::SixteenBit => entry
+                .status
+                .as_ref()
+                .is_some_and(|status| status.bit_depth == Some(SourceBitDepth::Sixteen)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct JobOverrides {
+    print_size: Option<PrintSizeMm>,
+    border_mm: Option<f32>,
+    border_style: Option<BorderStyle>,
+    output_format: Option<OutputFormat>,
+    quality: Option<u8>,
+    bit_depth: Option<BitDepth>,
+    png_compression: Option<u8>,
+    tiff_compression: Option<TiffCompression>,
+    tiff_deflate_level: Option<TiffDeflateLevel>,
+}
+
+#[derive(Clone, Copy)]
+enum SettingField {
+    PrintSize,
+    BorderWidth,
+    BorderStyle,
+    OutputFormat,
+    Quality,
+    BitDepth,
+    PngCompression,
+    TiffCompression,
+    TiffDeflateLevel,
+}
+
+impl JobOverrides {
+    fn apply(self, mut settings: JobSettings) -> JobSettings {
+        settings.processing.print_size = self.print_size.unwrap_or(settings.processing.print_size);
+        settings.processing.border_mm = self.border_mm.unwrap_or(settings.processing.border_mm);
+        settings.processing.border_style = self
+            .border_style
+            .unwrap_or(settings.processing.border_style);
+        settings.export.format = self.output_format.unwrap_or(settings.export.format);
+        settings.export.quality = self.quality.unwrap_or(settings.export.quality);
+        settings.export.bit_depth = self.bit_depth.unwrap_or(settings.export.bit_depth);
+        settings.export.png_compression = self
+            .png_compression
+            .unwrap_or(settings.export.png_compression);
+        settings.export.tiff_compression = self
+            .tiff_compression
+            .unwrap_or(settings.export.tiff_compression);
+        settings.export.tiff_deflate_level = self
+            .tiff_deflate_level
+            .unwrap_or(settings.export.tiff_deflate_level);
+        settings
+    }
+
+    fn set(&mut self, field: SettingField, settings: JobSettings) {
+        match field {
+            SettingField::PrintSize => self.print_size = Some(settings.processing.print_size),
+            SettingField::BorderWidth => self.border_mm = Some(settings.processing.border_mm),
+            SettingField::BorderStyle => {
+                self.border_style = Some(settings.processing.border_style);
+            }
+            SettingField::OutputFormat => self.output_format = Some(settings.export.format),
+            SettingField::Quality => self.quality = Some(settings.export.quality),
+            SettingField::BitDepth => self.bit_depth = Some(settings.export.bit_depth),
+            SettingField::PngCompression => {
+                self.png_compression = Some(settings.export.png_compression);
+            }
+            SettingField::TiffCompression => {
+                self.tiff_compression = Some(settings.export.tiff_compression);
+            }
+            SettingField::TiffDeflateLevel => {
+                self.tiff_deflate_level = Some(settings.export.tiff_deflate_level);
+            }
+        }
+    }
+
+    fn clear(&mut self, field: SettingField) {
+        match field {
+            SettingField::PrintSize => self.print_size = None,
+            SettingField::BorderWidth => self.border_mm = None,
+            SettingField::BorderStyle => self.border_style = None,
+            SettingField::OutputFormat => self.output_format = None,
+            SettingField::Quality => self.quality = None,
+            SettingField::BitDepth => self.bit_depth = None,
+            SettingField::PngCompression => self.png_compression = None,
+            SettingField::TiffCompression => self.tiff_compression = None,
+            SettingField::TiffDeflateLevel => self.tiff_deflate_level = None,
+        }
+    }
+}
+
 struct FileEntry {
     path: PathBuf,
     status: Option<FileStatus>,
+    overrides: JobOverrides,
 }
 
 impl FileEntry {
@@ -3570,8 +4430,21 @@ struct BatchExportPlan {
     output_dir: PathBuf,
     processing: ProcessingOptions,
     export: ExportOptions,
+    job_settings: HashMap<PathBuf, JobSettings>,
     output_profile_path: Option<PathBuf>,
     output_profile: Option<Arc<[u8]>>,
+}
+
+impl BatchExportPlan {
+    fn settings_for(&self, input: &Path) -> JobSettings {
+        self.job_settings
+            .get(input)
+            .copied()
+            .unwrap_or(JobSettings {
+                processing: self.processing,
+                export: self.export,
+            })
+    }
 }
 
 struct ExportPreflight {
@@ -3583,6 +4456,7 @@ struct ExportPreflight {
 struct ExportRuntime {
     processing: ProcessingOptions,
     export_options: ExportOptions,
+    job_settings: HashMap<PathBuf, JobSettings>,
     output_profile: Option<Arc<[u8]>>,
     pool: Option<Arc<rayon::ThreadPool>>,
     budget: Arc<ProcessingBudget>,
@@ -3773,6 +4647,7 @@ fn prepare_import(paths: Vec<PathBuf>, existing: Vec<PathBuf>) -> PreparedImport
             entries.push(FileEntry {
                 status: Some(status),
                 path,
+                overrides: JobOverrides::default(),
             });
         }
     }
@@ -4103,17 +4978,38 @@ fn export_worker_count(job_count: usize) -> usize {
         .min(job_count)
 }
 
+fn resolved_export_options(
+    source_depth: Option<SourceBitDepth>,
+    mut options: ExportOptions,
+) -> ExportOptions {
+    if options.format != OutputFormat::Tiff
+        || (options.bit_depth == BitDepth::Sixteen
+            && source_depth.is_some_and(|depth| depth != SourceBitDepth::Sixteen))
+    {
+        options.bit_depth = BitDepth::Eight;
+    }
+    options
+}
+
 fn export_batch(
     jobs: Vec<(PathBuf, PathBuf)>,
     runtime: ExportRuntime,
     results: async_channel::Sender<BatchFileResult>,
 ) {
     let export_job = |(input, output): &(PathBuf, PathBuf)| {
+        let settings = runtime
+            .job_settings
+            .get(input)
+            .copied()
+            .unwrap_or(JobSettings {
+                processing: runtime.processing,
+                export: runtime.export_options,
+            });
         let result = export_one(
             input,
             output,
-            runtime.processing,
-            runtime.export_options,
+            settings.processing,
+            settings.export,
             runtime.output_profile.as_deref(),
             &runtime.budget,
             &runtime.cancel,
@@ -4208,6 +5104,7 @@ fn export_one(
         return cancelled_export_result(input, output);
     }
     let source_bit_depth = loaded.bit_depth;
+    let export = resolved_export_options(Some(source_bit_depth), export);
     let source_icc_profile = loaded.icc_profile;
     let mut source_image = loaded.image;
     let converted_before_processing =
@@ -4419,7 +5316,9 @@ fn export_jobs_preflight(
                 continue;
             }
         };
-        if !can_export_bit_depth(metadata.bit_depth, &plan.export) {
+        let settings = plan.settings_for(&input);
+        let export = resolved_export_options(Some(metadata.bit_depth), settings.export);
+        if !can_export_bit_depth(metadata.bit_depth, &export) {
             results.push(BatchFileResult {
                 input,
                 planned_output: output,
@@ -4433,7 +5332,7 @@ fn export_jobs_preflight(
             metadata.dimensions.0,
             metadata.dimensions.1,
             metadata.bit_depth,
-            &plan.processing,
+            &settings.processing,
         )
         .map_err(|error| error.to_string())
         .and_then(|requirements| {
@@ -4573,23 +5472,47 @@ fn open_output_folder(path: &Path) -> io::Result<()> {
     ))
 }
 
+#[cfg(test)]
 fn planned_jobs(
     files: &[PathBuf],
     output_dir: &Path,
     format: OutputFormat,
 ) -> Vec<(PathBuf, PathBuf)> {
+    let settings = files
+        .iter()
+        .map(|input| (input.clone(), format))
+        .collect::<Vec<_>>();
+    planned_jobs_for_formats(&settings, output_dir)
+}
+
+fn planned_jobs_with_settings(
+    files: &[PathBuf],
+    output_dir: &Path,
+    plan: &BatchExportPlan,
+) -> Vec<(PathBuf, PathBuf)> {
+    let settings = files
+        .iter()
+        .map(|input| (input.clone(), plan.settings_for(input).export.format))
+        .collect::<Vec<_>>();
+    planned_jobs_for_formats(&settings, output_dir)
+}
+
+fn planned_jobs_for_formats(
+    files: &[(PathBuf, OutputFormat)],
+    output_dir: &Path,
+) -> Vec<(PathBuf, PathBuf)> {
     let mut reserved = HashSet::new();
     files
         .iter()
-        .map(|input| {
-            let mut output = unique_output_path(input, output_dir, format);
+        .map(|(input, format)| {
+            let mut output = unique_output_path(input, output_dir, *format);
             if reserved.contains(&output) {
                 let stem = input
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .filter(|stem| !stem.is_empty())
                     .unwrap_or("image");
-                let extension = crate::export::extension(format);
+                let extension = crate::export::extension(*format);
                 for index in 1.. {
                     let candidate = output_dir.join(format!("{stem}_preprint_{index}.{extension}"));
                     if !candidate.exists() && !reserved.contains(&candidate) {
@@ -4686,6 +5609,7 @@ mod tests {
                 thumbnail: None,
                 error: None,
             }),
+            overrides: JobOverrides::default(),
         };
 
         let low =
@@ -4898,6 +5822,7 @@ mod tests {
                     BorderStyle::White,
                 ),
                 export_options: ExportOptions::new(OutputFormat::Png, 90),
+                job_settings: HashMap::new(),
                 output_profile: None,
                 pool: Some(pool),
                 budget: budget.clone(),
@@ -5234,6 +6159,7 @@ mod tests {
         let entry = FileEntry {
             path,
             status: Some(status.clone()),
+            overrides: JobOverrides::default(),
         };
         let thumbnail = status.thumbnail.unwrap();
         let decoded = image::load_from_memory(&thumbnail.bytes).unwrap();
@@ -5264,48 +6190,94 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_bit_default_falls_back_for_eight_bit_source() {
-        let mut app = PreprintApp::default();
-        app.files.push(FileEntry {
-            path: PathBuf::from("eight-bit.tiff"),
-            status: Some(FileStatus {
-                dimensions: Some((100, 100)),
-                bit_depth: Some(SourceBitDepth::Eight),
-                format: Some(ImageFormat::Tiff),
-                color_space: Some("sRGB".into()),
-                thumbnail: None,
-                error: None,
-            }),
-        });
+    fn sixteen_bit_preference_resolves_to_eight_bit_for_eight_bit_source() {
+        let app = PreprintApp::default();
+        let resolved = resolved_export_options(Some(SourceBitDepth::Eight), app.export_options());
 
-        app.normalize_bit_depth_choice();
-
-        assert_eq!(app.bit_depth, BitDepth::Eight);
+        assert_eq!(app.bit_depth, BitDepth::Sixteen);
+        assert_eq!(resolved.bit_depth, BitDepth::Eight);
     }
 
     #[test]
-    fn sixteen_bit_default_falls_back_for_mixed_batch() {
-        let mut app = PreprintApp::default();
-        for (name, bit_depth) in [
-            ("sixteen-bit.tiff", SourceBitDepth::Sixteen),
-            ("eight-bit.tiff", SourceBitDepth::Eight),
-        ] {
-            app.files.push(FileEntry {
+    fn sixteen_bit_preference_resolves_per_source_in_mixed_batch() {
+        let app = PreprintApp::default();
+        let sixteen = resolved_export_options(Some(SourceBitDepth::Sixteen), app.export_options());
+        let eight = resolved_export_options(Some(SourceBitDepth::Eight), app.export_options());
+
+        assert_eq!(app.bit_depth, BitDepth::Sixteen);
+        assert_eq!(sixteen.bit_depth, BitDepth::Sixteen);
+        assert_eq!(eight.bit_depth, BitDepth::Eight);
+    }
+
+    #[test]
+    fn selected_setting_changes_create_sparse_overrides() {
+        let files = ["first.tiff", "second.tiff"]
+            .into_iter()
+            .map(|name| FileEntry {
                 path: PathBuf::from(name),
-                status: Some(FileStatus {
-                    dimensions: Some((100, 100)),
-                    bit_depth: Some(bit_depth),
-                    format: Some(ImageFormat::Tiff),
-                    color_space: Some("sRGB".into()),
-                    thumbnail: None,
-                    error: None,
-                }),
-            });
-        }
+                status: None,
+                overrides: JobOverrides::default(),
+            })
+            .collect();
+        let mut app = PreprintApp {
+            files,
+            ..PreprintApp::default()
+        };
+        app.selected_indices.insert(0);
+        app.print_width_cm = 80.0;
+        app.print_height_cm = 60.0;
 
-        app.normalize_bit_depth_choice();
+        app.apply_setting_to_selection(SettingField::PrintSize);
 
-        assert_eq!(app.bit_depth, BitDepth::Eight);
+        assert_eq!(
+            app.job_settings_for_entry(&app.files[0])
+                .processing
+                .print_size,
+            PrintSizeMm::new(800.0, 600.0)
+        );
+        assert_eq!(
+            app.job_settings_for_entry(&app.files[1])
+                .processing
+                .print_size,
+            PrintSizeMm::new(600.0, 400.0)
+        );
+        assert!(app.files[0].overrides.border_mm.is_none());
+        app.selected_indices.insert(1);
+        assert!(app.selection_has_mixed_settings());
+    }
+
+    #[test]
+    fn changing_all_images_updates_default_and_clears_field_overrides() {
+        let files = ["first.tiff", "second.tiff"]
+            .into_iter()
+            .map(|name| FileEntry {
+                path: PathBuf::from(name),
+                status: None,
+                overrides: JobOverrides {
+                    print_size: Some(PrintSizeMm::new(800.0, 600.0)),
+                    ..JobOverrides::default()
+                },
+            })
+            .collect();
+        let mut app = PreprintApp {
+            files,
+            ..PreprintApp::default()
+        };
+        app.selected_indices.extend(0..app.files.len());
+        app.print_width_cm = 30.0;
+        app.print_height_cm = 20.0;
+
+        app.apply_setting_to_selection(SettingField::PrintSize);
+
+        assert_eq!(
+            app.batch_defaults.processing.print_size,
+            PrintSizeMm::new(300.0, 200.0)
+        );
+        assert!(
+            app.files
+                .iter()
+                .all(|entry| entry.overrides.print_size.is_none())
+        );
     }
 
     #[test]
@@ -5321,6 +6293,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: ExportOptions::new(OutputFormat::Tiff, 90),
+            job_settings: HashMap::new(),
             output_profile_path: None,
             output_profile: None,
         };
@@ -5339,14 +6312,14 @@ mod tests {
     }
 
     #[test]
-    fn export_preflight_returns_wrong_depth_as_per_file_failure() {
+    fn export_preflight_downgrades_incompatible_source_depth_per_file() {
         crate::i18n::init();
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("eight-bit.png");
         DynamicImage::new_rgba8(2, 2).save(&input).unwrap();
         let mut options = ExportOptions::new(OutputFormat::Tiff, 90);
         options.bit_depth = BitDepth::Sixteen;
-        let jobs = vec![(input, dir.path().join("out.tiff"))];
+        let jobs = vec![(input.clone(), dir.path().join("out.tiff"))];
         let plan = BatchExportPlan {
             output_dir: dir.path().to_path_buf(),
             processing: ProcessingOptions::new(
@@ -5355,6 +6328,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: options,
+            job_settings: HashMap::new(),
             output_profile_path: None,
             output_profile: None,
         };
@@ -5362,12 +6336,9 @@ mod tests {
 
         let preflight = export_jobs_preflight(jobs, &plan, &cancel);
 
-        assert!(preflight.jobs.is_empty());
-        assert_eq!(preflight.results.len(), 1);
-        assert_eq!(
-            preflight.results[0].error.as_deref(),
-            Some("16-bit export requires every image in the batch to be 16-bit.")
-        );
+        assert_eq!(preflight.jobs.len(), 1);
+        assert_eq!(preflight.jobs[0].0, input);
+        assert!(preflight.results.is_empty());
     }
 
     #[test]
@@ -5392,6 +6363,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: ExportOptions::new(OutputFormat::Png, 90),
+            job_settings: HashMap::new(),
             output_profile_path: None,
             output_profile: None,
         };
@@ -5423,6 +6395,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: ExportOptions::new(OutputFormat::Png, 90),
+            job_settings: HashMap::new(),
             output_profile_path: Some(profile_path),
             output_profile: None,
         };
@@ -5468,6 +6441,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: ExportOptions::new(OutputFormat::Png, 90),
+            job_settings: HashMap::new(),
             output_profile_path: Some(profile_path),
             output_profile: None,
         };
@@ -5500,6 +6474,7 @@ mod tests {
                 BorderStyle::White,
             ),
             export: ExportOptions::new(OutputFormat::Png, 90),
+            job_settings: HashMap::new(),
             output_profile_path: None,
             output_profile: None,
         };
